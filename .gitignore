@@ -1,0 +1,44 @@
+# Environment / secrets — NEVER commit real values
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+ccloud-api-key.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node / UI
+node_modules/
+ui/dist/
+ui/build/
+*.local
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
