@@ -21,6 +21,7 @@ Two invariants are enforced structurally here:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 from typing import Any
 
 import psycopg
@@ -29,18 +30,43 @@ from psycopg.types.json import Jsonb
 
 from kernel import audit
 from kernel.db import Database, get_default_database
-from kernel.errors import InvalidStateError, NotFoundError, ReadOnlyError
-from kernel.models import Decision, Memory
+from kernel.embeddings import EmbeddingProvider, vector_literal
+from kernel.errors import EmbeddingError, InvalidStateError, NotFoundError, ReadOnlyError
+from kernel.models import Decision, Memory, RecallResult
 
-# Columns selected for Memory rows. embedding is intentionally excluded in
-# Phase 1 (always NULL; populated in Phase 2).
-_MEMORY_COLS = (
+# Columns selected for Memory rows. embedding is intentionally excluded — it is a
+# 1024-float vector we never need to return; queries that rank by it compute a
+# scalar similarity instead.
+MEMORY_COLUMNS = (
     "id, branch_id, kind, content, source, confidence, status, "
     "superseded_by, metadata, created_at"
 )
+_MEMORY_COLS = MEMORY_COLUMNS  # internal alias
 _DECISION_COLS = (
     "id, branch_id, agent_id, input_hash, action, rationale, outcome, created_at"
 )
+
+
+def resolve_branch(cur: psycopg.Cursor, branch: str | uuid.UUID) -> dict[str, Any]:
+    """Resolve a branch by id (if it parses as a UUID) or by name.
+
+    Shared by the memory and recall paths. Raises :class:`NotFoundError` if no
+    branch matches.
+    """
+    row = None
+    try:
+        uuid.UUID(str(branch))
+    except ValueError:
+        pass
+    else:
+        cur.execute("SELECT id, name FROM branches WHERE id = %s", (branch,))
+        row = cur.fetchone()
+    if row is None:
+        cur.execute("SELECT id, name FROM branches WHERE name = %s", (str(branch),))
+        row = cur.fetchone()
+    if row is None:
+        raise NotFoundError(f"branch not found: {branch}")
+    return row
 
 
 class MemoryKernel:
@@ -51,22 +77,40 @@ class MemoryKernel:
     process configuration (``RECALL_ACTOR_ID`` / ``RECALL_READ_ONLY``).
     """
 
-    def __init__(self, db: Database, *, actor: str, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        db: Database,
+        *,
+        actor: str,
+        read_only: bool = False,
+        embedder: EmbeddingProvider | None = None,
+    ) -> None:
         if not actor:
             raise ValueError("MemoryKernel requires a non-empty actor")
         self.db = db
         self.actor = actor
         self.read_only = read_only
+        self.embedder = embedder
 
     @classmethod
-    def from_settings(cls, db: Database | None = None) -> MemoryKernel:
-        """Build a kernel using the process configuration."""
+    def from_settings(
+        cls,
+        db: Database | None = None,
+        embedder: EmbeddingProvider | None = None,
+    ) -> MemoryKernel:
+        """Build a kernel using the process configuration.
+
+        Defaults to a real Bedrock embedding provider (constructed lazily, so no
+        AWS call happens until the first embed).
+        """
         from kernel.config import settings
+        from kernel.embeddings import BedrockEmbeddingProvider
 
         return cls(
             db or get_default_database(),
             actor=settings.recall_actor_id,
             read_only=settings.recall_read_only,
+            embedder=embedder or BedrockEmbeddingProvider(),
         )
 
     # -- internal helpers -------------------------------------------------
@@ -77,23 +121,23 @@ class MemoryKernel:
                 "kernel is in read-only mode (RECALL_READ_ONLY); writes are blocked"
             )
 
-    @staticmethod
-    def _resolve_branch(cur: psycopg.Cursor, branch: str | uuid.UUID) -> dict[str, Any]:
-        """Resolve a branch by id (if it parses as a UUID) or by name."""
-        row = None
-        try:
-            uuid.UUID(str(branch))
-        except ValueError:
-            pass
-        else:
-            cur.execute("SELECT id, name FROM branches WHERE id = %s", (branch,))
-            row = cur.fetchone()
-        if row is None:
-            cur.execute("SELECT id, name FROM branches WHERE name = %s", (str(branch),))
-            row = cur.fetchone()
-        if row is None:
-            raise NotFoundError(f"branch not found: {branch}")
-        return row
+    def _resolve_branch(self, cur: psycopg.Cursor, branch: str | uuid.UUID) -> dict[str, Any]:
+        return resolve_branch(cur, branch)
+
+    def _embed(self, text: str) -> str:
+        """Embed ``text`` and return a CockroachDB VECTOR literal.
+
+        Called before opening the write transaction so serialization-failure
+        retries never re-invoke the (paid, network) embedding call. If embedding
+        fails, the caller raises before any row is written — a memory is never
+        persisted without its embedding.
+        """
+        if self.embedder is None:
+            raise EmbeddingError(
+                "MemoryKernel has no embedder; cannot write memories "
+                "(construct with embedder=... or use from_settings())"
+            )
+        return vector_literal(self.embedder.embed(text))
 
     # -- write paths ------------------------------------------------------
 
@@ -106,18 +150,31 @@ class MemoryKernel:
         confidence: float = 1.0,
         metadata: dict[str, Any] | None = None,
     ) -> Memory:
-        """Record a new memory on ``branch`` and audit it."""
+        """Record a new memory on ``branch``, embedding it on write, and audit it.
+
+        The embedding is computed first; if it fails, the whole write fails and no
+        row is stored (a memory is never persisted without its embedding).
+        """
         self._require_writable()
+        embedding_literal = self._embed(content)
 
         def work(conn: psycopg.Connection) -> Memory:
             with conn.cursor(row_factory=dict_row) as cur:
                 b = self._resolve_branch(cur, branch)
                 cur.execute(
                     f"INSERT INTO memories "
-                    f"  (branch_id, kind, content, source, confidence, metadata) "
-                    f"VALUES (%s, %s, %s, %s, %s, %s) "
+                    f"  (branch_id, kind, content, embedding, source, confidence, metadata) "
+                    f"VALUES (%s, %s, %s, %s::VECTOR, %s, %s, %s) "
                     f"RETURNING {_MEMORY_COLS}",
-                    (b["id"], kind, content, source, confidence, Jsonb(metadata or {})),
+                    (
+                        b["id"],
+                        kind,
+                        content,
+                        embedding_literal,
+                        source,
+                        confidence,
+                        Jsonb(metadata or {}),
+                    ),
                 )
                 row = cur.fetchone()
                 audit.record(
@@ -150,9 +207,11 @@ class MemoryKernel:
 
         The old row is marked ``superseded`` and linked to the replacement via
         ``superseded_by``; it is never deleted. Fields not supplied are inherited
-        from the old memory.
+        from the old memory. The replacement is embedded from ``new_content`` on
+        write (same failure semantics as ``remember``).
         """
         self._require_writable()
+        embedding_literal = self._embed(new_content)
 
         def work(conn: psycopg.Connection) -> Memory:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -171,13 +230,14 @@ class MemoryKernel:
 
                 cur.execute(
                     f"INSERT INTO memories "
-                    f"  (branch_id, kind, content, source, confidence, metadata) "
-                    f"VALUES (%s, %s, %s, %s, %s, %s) "
+                    f"  (branch_id, kind, content, embedding, source, confidence, metadata) "
+                    f"VALUES (%s, %s, %s, %s::VECTOR, %s, %s, %s) "
                     f"RETURNING {_MEMORY_COLS}",
                     (
                         old["branch_id"],
                         kind if kind is not None else old["kind"],
                         new_content,
+                        embedding_literal,
                         source if source is not None else old["source"],
                         confidence if confidence is not None else old["confidence"],
                         Jsonb(metadata if metadata is not None else old["metadata"]),
@@ -338,3 +398,32 @@ class MemoryKernel:
                 return [Memory.model_validate(r) for r in rows]
 
         return self.db.run_in_transaction(work)
+
+    def recall(
+        self,
+        branch: str,
+        query: str,
+        k: int = 10,
+        kind: str | None = None,
+        min_confidence: float | None = None,
+        since: datetime | None = None,
+        status: str | None = "active",
+    ) -> list[RecallResult]:
+        """Hybrid vector + structured-filter retrieval on ``branch`` (audited).
+
+        Delegates to :func:`kernel.recall.recall`. Allowed in read-only mode.
+        """
+        from kernel.recall import recall as _recall
+
+        return _recall(
+            self.db,
+            self.embedder,
+            self.actor,
+            branch,
+            query,
+            k=k,
+            kind=kind,
+            min_confidence=min_confidence,
+            since=since,
+            status=status,
+        )

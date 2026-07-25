@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import psycopg
 
-from kernel.migrate import migrate
+from kernel.migrate import discover_migrations, migrate
 from tests.conftest import requires_crdb
 
 pytestmark = requires_crdb
 
+_ALL_VERSIONS = [version for version, _ in discover_migrations()]
+
 
 def test_migrate_applies_then_is_idempotent(empty_dsn: str):
     first = migrate(dsn=empty_dsn)
-    assert "001" in first  # the init migration ran
+    assert first == _ALL_VERSIONS  # every migration ran, in order
 
     second = migrate(dsn=empty_dsn)
     assert second == []  # nothing left to do the second time
@@ -22,9 +24,12 @@ def test_migrate_records_versions_once(empty_dsn: str):
     migrate(dsn=empty_dsn)
     migrate(dsn=empty_dsn)  # re-run
     with psycopg.connect(empty_dsn) as conn:
-        rows = conn.execute("SELECT version FROM schema_migrations").fetchall()
+        rows = conn.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
     versions = [r[0] for r in rows]
-    assert versions == ["001"]  # exactly one ledger row, not duplicated
+    # Each migration recorded exactly once, no duplicates on re-run.
+    assert versions == _ALL_VERSIONS
 
 
 def test_seed_root_branch(test_dsn: str):

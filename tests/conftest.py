@@ -22,6 +22,7 @@ import psycopg
 import pytest
 
 from kernel.db import Database
+from kernel.embeddings import FakeEmbeddingProvider
 from kernel.memory import MemoryKernel
 from kernel.migrate import migrate
 
@@ -61,6 +62,20 @@ requires_crdb = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _enable_vector_index() -> None:
+    """Enable the cluster setting required by migration 002's vector index.
+
+    This is a cluster-wide (not per-database) setting; enabling it once for the
+    session is enough. A no-op if the cluster is unreachable — the DB-backed
+    tests skip in that case anyway.
+    """
+    if not _crdb_available():
+        return
+    with psycopg.connect(_admin_dsn(), autocommit=True) as conn:
+        conn.execute("SET CLUSTER SETTING feature.vector_index.enabled = true")
+
+
 @pytest.fixture
 def empty_dsn() -> Iterator[str]:
     """Create a fresh, empty (un-migrated) database; drop it on teardown."""
@@ -92,8 +107,13 @@ def db(test_dsn: str) -> Iterator[Database]:
 
 
 @pytest.fixture
-def kernel(db: Database) -> MemoryKernel:
-    return MemoryKernel(db, actor="tester", read_only=False)
+def fake_embedder() -> FakeEmbeddingProvider:
+    return FakeEmbeddingProvider()
+
+
+@pytest.fixture
+def kernel(db: Database, fake_embedder: FakeEmbeddingProvider) -> MemoryKernel:
+    return MemoryKernel(db, actor="tester", read_only=False, embedder=fake_embedder)
 
 
 def audit_count(dsn: str, op: str | None = None) -> int:

@@ -133,6 +133,20 @@ warn "Nightly backup configuration is stubbed pending flag verification."
 warn "Confirm with: ccloud cluster --help  (look for a backup/backup-config group)."
 
 # ---------------------------------------------------------------------------
+# 4b. Enable the vector index feature (required by migration 002)
+# ---------------------------------------------------------------------------
+# Recall's vector index requires this cluster setting. It is applied over SQL,
+# not the ccloud control plane:
+#     SET CLUSTER SETTING feature.vector_index.enabled = true;
+# TODO(verify): the exact way to run one-off SQL via ccloud (e.g. a
+# `ccloud cluster sql` subcommand). Until verified, run it with cockroach sql
+# against the connection string, e.g.:
+#   cockroach sql --url "$conn_str" \
+#       -e "SET CLUSTER SETTING feature.vector_index.enabled = true;"
+warn "Remember to enable the vector index feature before migrating:"
+warn "  SET CLUSTER SETTING feature.vector_index.enabled = true;"
+
+# ---------------------------------------------------------------------------
 # 5. Report connection string (no secrets echoed to files)
 # ---------------------------------------------------------------------------
 log "Fetching connection string template for SQL user '${SQL_USER}'..."
