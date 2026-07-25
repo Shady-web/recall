@@ -101,9 +101,54 @@ python -m kernel.migrate                 # uses CRDB_CONNECTION_STRING
 python -m kernel.migrate --dsn <dsn>     # explicit target
 ```
 
-`memories.embedding` is `VECTOR(1024)` (matching Amazon Titan Text Embeddings V2)
-but is left nullable and unindexed until Phase 2. The runner seeds a root branch
-named `main`.
+`memories.embedding` is `VECTOR(1024)` (matching Amazon Titan Text Embeddings V2).
+Migration `002` adds the vector index on it. The runner seeds a root branch named
+`main`.
+
+**Vector index prerequisite.** Migration `002` creates a vector index, which
+requires the cluster setting `feature.vector_index.enabled = true`. This is a
+cluster-wide setting a database-scoped role may not be able to change, so the
+migration does *not* set it; enable it once against your cluster before running
+migrations:
+
+```sql
+SET CLUSTER SETTING feature.vector_index.enabled = true;
+```
+
+(Provisioning and the test harness handle this for you.)
+
+## Embeddings & recall
+
+Memories are embedded on write via `kernel/embeddings.py`:
+
+- `BedrockEmbeddingProvider` calls Amazon Titan Text Embeddings V2
+  (`amazon.titan-embed-text-v2:0`) through Bedrock, with retry/backoff on
+  throttling.
+- `FakeEmbeddingProvider` is a deterministic, offline provider so the whole test
+  suite and the benchmark run with no AWS credentials or cost.
+
+`kernel/recall.py` provides hybrid retrieval — vector similarity plus structured
+SQL filters in one query (branch, `kind`, `min_confidence`, `since`, `status`),
+returning a similarity score and rank per hit. The vector index is L2-only;
+because embeddings are unit-normalized, L2 ranking equals cosine ranking and
+similarity is reported as `1 - dist²/2`. Recall is branch-scoped today; ancestry
+resolution across parent branches is a marked TODO seam for Phase 3.
+
+Backfill embeddings for any pre-Phase-2 rows:
+
+```bash
+python -m kernel.backfill            # embeds memories with a NULL embedding
+```
+
+## Benchmark
+
+`benchmarks/bench_recall.py` loads 50k synthetic memories and reports recall
+latency (p50/p95/p99). It uses the fake provider, so it needs no AWS. Committed
+results live in [`benchmarks/recall_benchmark.md`](./benchmarks/recall_benchmark.md).
+
+```bash
+python benchmarks/bench_recall.py --count 50000 --queries 300
+```
 
 ## Development
 
@@ -135,11 +180,11 @@ database-backed tests are skipped (with a message) rather than failing.
 
 ## Status
 
-**Phase 1 — Schema & kernel core.** Migrations, the migration runner, pydantic
-models, and the non-semantic memory API (`remember` / `get` / `list_memories` /
-`supersede` / `retract` / `record_decision`) are in place, each writing an audit
-row in the same transaction as the operation. No embeddings, vector search, or
-branching yet — those arrive in Phase 2+ (see `CONTEXT.md` §8).
+**Phase 2 — Embeddings & recall.** Memories embed on write (Bedrock Titan V2,
+with a deterministic fake provider for tests), the vector index is in place, and
+hybrid branch-scoped recall combines vector similarity with structured SQL
+filters. Recall is single-branch; branch forking, commit, and diff arrive in
+Phase 3 (see `CONTEXT.md` §8).
 
 ## License
 

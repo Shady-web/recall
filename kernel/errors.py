@@ -23,3 +23,7 @@ class InvalidStateError(RecallError):
 
     e.g. superseding a memory that is not ``active``.
     """
+
+
+class EmbeddingError(RecallError):
+    """Raised when producing an embedding fails (e.g. Bedrock error/throttling)."""

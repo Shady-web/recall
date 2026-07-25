@@ -1,0 +1,39 @@
+-- 002_vector_index.sql — vector index on memories.embedding (Phase 2).
+--
+-- Enables semantic recall. Design decisions, documented per the Phase 2 brief:
+--
+--  * Index type: CockroachDB's distributed vector index (C-SPANN). It is the
+--    only vector index CockroachDB offers, and it accelerates approximate
+--    nearest-neighbour (ANN) search of the form
+--        ... ORDER BY embedding <-> $query LIMIT k
+--
+--  * Distance metric: L2 (`<->`) with the default vector_l2_ops operator class.
+--    CockroachDB's vector index supports ONLY L2 distance today — cosine and
+--    inner product are not indexable. This is fine for Recall because both
+--    Amazon Titan Text Embeddings V2 (normalize=true) and our embedding clients
+--    return UNIT-NORMALIZED vectors, and for unit vectors L2 ordering is
+--    monotonic with cosine distance (‖a-b‖² = 2 - 2·cos). So ranking by `<->`
+--    is identical to ranking by cosine; the kernel derives cosine similarity as
+--    1 - (‖a-b‖²)/2.
+--      ref: https://www.cockroachlabs.com/docs/v25.2/vector-indexes
+--
+--  * Prefix column: branch_id. Recall is always branch-scoped, so branch_id is
+--    an index prefix (the index requires an exact match on it). This lets one
+--    query filter to a branch AND run ANN inside it using the index. Ancestry
+--    resolution across parent branches arrives in Phase 3; until then recall
+--    matches a single branch_id, which is exactly what this prefix supports.
+--
+--  * Tuning: min_partition_size / max_partition_size are left at their defaults
+--    (16 / 128), which suit datasets up to the low millions of vectors; see the
+--    benchmark in benchmarks/ for measured latency. We name the index so it can
+--    be dropped/rebuilt (e.g. for bulk loads) deterministically.
+--
+--  PREREQUISITE (cluster-level, not run here): the cluster setting
+--      SET CLUSTER SETTING feature.vector_index.enabled = true;
+--  must be enabled before this migration runs. It is a cluster-wide setting that
+--  a database-scoped app role may not be permitted to change, so we do NOT run
+--  it inside the migration. Provisioning (infra/provision.sh) and the test
+--  harness enable it; see the README.
+
+CREATE VECTOR INDEX IF NOT EXISTS vec_memories_embedding
+    ON memories (branch_id, embedding);

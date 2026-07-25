@@ -65,3 +65,11 @@ class AuditEntry(_Row):
     target_id: uuid.UUID | None = None
     payload: dict[str, Any] = {}
     created_at: datetime
+
+
+class RecallResult(BaseModel):
+    """One hit from a recall query: a memory plus its score and 1-based rank."""
+
+    memory: Memory
+    similarity: float
+    rank: int
