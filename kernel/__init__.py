@@ -8,6 +8,7 @@ kernel. If a component outside this package writes SQL directly, that is a bug.
 __all__ = [
     "audit",
     "backfill",
+    "branching",
     "config",
     "db",
     "embeddings",

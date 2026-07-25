@@ -140,6 +140,50 @@ Backfill embeddings for any pre-Phase-2 rows:
 python -m kernel.backfill            # embeds memories with a NULL embedding
 ```
 
+## Branching
+
+Memory is branchable: fork a branch, speculate on it, then commit or discard.
+
+```python
+fork(db, actor, "main", "hotfix")     # child branch, fork_point_ts = now()
+kernel.remember("hotfix", ...)        # never affects the parent
+kernel.recall("hotfix", "...")        # sees own memories + parent as of the fork
+commit(db, actor, "hotfix")           # replays onto parent, or returns conflicts
+discard(db, actor, "hotfix")          # marks discarded; nothing is deleted
+diff(db, actor, "main", "hotfix")     # added / superseded / retracted per side
+```
+
+Run `python scripts/demo_branching.py` for an end-to-end walkthrough.
+
+### Ancestry uses logical time-travel, not `AS OF SYSTEM TIME`
+
+`CONTEXT.md` §7 originally assumed a recursive CTE with `AS OF SYSTEM TIME` at
+each fork point. **That is not implementable on CockroachDB**, verified against
+v25.2:
+
+- AOST must be attached to a **top-level statement**. In a CTE, sub-select, or
+  one arm of a `UNION` it fails with `AS OF SYSTEM TIME must be provided on a
+  top-level statement` — so one statement cannot read different ancestry
+  segments at different timestamps.
+- AOST cannot look back past MVCC garbage collection (`gc.ttlseconds`, default
+  4h), so a branch outliving the GC window would become unreadable.
+
+Ancestry therefore bounds each segment with `created_at <= fork_point`, and
+status changes carry timestamps (`superseded_at` / `retracted_at`, migration
+003) so "status as of T" is computable in SQL. This is exact for append-only
+memory rows, is not GC-bounded, and keeps the read in one index-accelerated
+statement.
+
+`AS OF SYSTEM TIME` remains load-bearing for **Phase 4 replay**, where a single
+whole-statement timestamp is the right tool — verified working, and verified
+compatible with the vector index.
+
+One structural constraint worth knowing: writing
+`branch_id IN (SELECT id FROM ancestry_cte)` **defeats the vector index** (the
+planner full-scans). So `resolve_ancestry()` runs the recursive CTE over the tiny
+`branches` table first and the resolved ids are passed as a literal list, which
+preserves index prefix spans. A regression test asserts this.
+
 ## Benchmark
 
 `benchmarks/bench_recall.py` loads 50k synthetic memories and reports recall
@@ -180,11 +224,11 @@ database-backed tests are skipped (with a message) rather than failing.
 
 ## Status
 
-**Phase 2 — Embeddings & recall.** Memories embed on write (Bedrock Titan V2,
-with a deterministic fake provider for tests), the vector index is in place, and
-hybrid branch-scoped recall combines vector similarity with structured SQL
-filters. Recall is single-branch; branch forking, commit, and diff arrive in
-Phase 3 (see `CONTEXT.md` §8).
+**Phase 3 — Branching engine.** Memory is branchable: `fork` / `commit` /
+`discard` / `diff`, full ancestry resolution wired into recall, structured
+commit-time conflict detection, and concurrency tests running real threads
+against a real cluster. Replay and provenance (`explain_decision`) arrive in
+Phase 4 (see `CONTEXT.md` §8).
 
 ## License
 
