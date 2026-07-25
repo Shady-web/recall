@@ -73,3 +73,64 @@ class RecallResult(BaseModel):
     memory: Memory
     similarity: float
     rank: int
+
+
+class AncestrySegment(BaseModel):
+    """One link in a branch's ancestry chain.
+
+    ``visible_as_of`` is the upper bound on ``created_at`` for memories on this
+    branch to be visible from the branch the ancestry was resolved for. It is
+    ``None`` for the branch itself (its own writes are always visible, live).
+    """
+
+    branch_id: uuid.UUID
+    name: str
+    depth: int
+    visible_as_of: datetime | None = None
+
+
+class MemoryConflict(BaseModel):
+    """A commit-time conflict, returned as data rather than raised.
+
+    Raised (as data) when a branch modified an inherited memory that the parent
+    also changed after the fork point.
+    """
+
+    memory_id: uuid.UUID
+    content: str
+    branch_status: str
+    parent_status: str
+    parent_changed_at: datetime
+    fork_point_ts: datetime
+    reason: str = "memory was modified on both the branch and the parent after the fork point"
+
+
+class CommitResult(BaseModel):
+    """Outcome of :func:`kernel.branching.commit`.
+
+    When ``committed`` is False the commit was a no-op: nothing was replayed and
+    the branch is left open. The caller decides what to do about ``conflicts``.
+    """
+
+    branch_id: uuid.UUID
+    committed: bool
+    replayed_memory_ids: list[uuid.UUID] = []
+    applied_override_ids: list[uuid.UUID] = []
+    conflicts: list[MemoryConflict] = []
+
+
+class BranchSideDiff(BaseModel):
+    """What one side of a diff did, relative to the common ancestry."""
+
+    branch_id: uuid.UUID
+    name: str
+    added: list[uuid.UUID] = []
+    superseded: list[uuid.UUID] = []
+    retracted: list[uuid.UUID] = []
+
+
+class BranchDiff(BaseModel):
+    """Symmetric diff between two branches."""
+
+    a: BranchSideDiff
+    b: BranchSideDiff

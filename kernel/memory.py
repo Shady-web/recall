@@ -202,6 +202,7 @@ class MemoryKernel:
         source: str | None = None,
         confidence: float | None = None,
         metadata: dict[str, Any] | None = None,
+        branch: str | uuid.UUID | None = None,
     ) -> Memory:
         """Replace an active memory with a new one, preserving history.
 
@@ -209,6 +210,13 @@ class MemoryKernel:
         ``superseded_by``; it is never deleted. Fields not supplied are inherited
         from the old memory. The replacement is embedded from ``new_content`` on
         write (same failure semantics as ``remember``).
+
+        ``branch`` selects the branch performing the supersession. When it is the
+        memory's own branch (the default) the row is updated in place. When it is
+        a *descendant* branch, the ancestor's row is left untouched — the
+        replacement is written on the descendant and a branch-local
+        ``memory_overrides`` row shadows the inherited memory, so the parent is
+        unaffected.
         """
         self._require_writable()
         embedding_literal = self._embed(new_content)
@@ -222,11 +230,26 @@ class MemoryKernel:
                 old = cur.fetchone()
                 if old is None:
                     raise NotFoundError(f"memory not found: {memory_id}")
-                if old["status"] != "active":
+
+                acting_branch_id = (
+                    old["branch_id"] if branch is None else resolve_branch(cur, branch)["id"]
+                )
+                in_place = acting_branch_id == old["branch_id"]
+
+                if in_place and old["status"] != "active":
                     raise InvalidStateError(
                         f"cannot supersede memory {memory_id} in status "
                         f"{old['status']!r}; only 'active' memories can be superseded"
                     )
+                if not in_place:
+                    cur.execute(
+                        "SELECT 1 FROM memory_overrides WHERE branch_id = %s AND memory_id = %s",
+                        (acting_branch_id, memory_id),
+                    )
+                    if cur.fetchone() is not None:
+                        raise InvalidStateError(
+                            f"memory {memory_id} is already overridden on this branch"
+                        )
 
                 cur.execute(
                     f"INSERT INTO memories "
@@ -234,7 +257,7 @@ class MemoryKernel:
                     f"VALUES (%s, %s, %s, %s::VECTOR, %s, %s, %s) "
                     f"RETURNING {_MEMORY_COLS}",
                     (
-                        old["branch_id"],
+                        acting_branch_id,
                         kind if kind is not None else old["kind"],
                         new_content,
                         embedding_literal,
@@ -244,48 +267,128 @@ class MemoryKernel:
                     ),
                 )
                 new_row = cur.fetchone()
-                cur.execute(
-                    "UPDATE memories SET status = 'superseded', superseded_by = %s "
-                    "WHERE id = %s",
-                    (new_row["id"], memory_id),
-                )
+
+                if in_place:
+                    cur.execute(
+                        "UPDATE memories SET status = 'superseded', superseded_by = %s, "
+                        "superseded_at = now() WHERE id = %s",
+                        (new_row["id"], memory_id),
+                    )
+                else:
+                    # Never touch the ancestor's row — shadow it for this branch.
+                    cur.execute(
+                        "INSERT INTO memory_overrides "
+                        "  (branch_id, memory_id, status, superseded_by) "
+                        "VALUES (%s, %s, 'superseded', %s)",
+                        (acting_branch_id, memory_id, new_row["id"]),
+                    )
+
                 audit.record(
                     conn,
                     actor=self.actor,
                     op="supersede",
                     target_type="memory",
                     target_id=new_row["id"],
-                    payload={"superseded": str(memory_id)},
+                    payload={
+                        "superseded": str(memory_id),
+                        "branch_id": str(acting_branch_id),
+                        "in_place": in_place,
+                    },
                 )
                 return Memory.model_validate(new_row)
 
         return self.db.run_in_transaction(work)
 
-    def retract(self, memory_id: str | uuid.UUID, reason: str) -> Memory:
-        """Mark a memory ``retracted`` (never deleted) and audit the reason."""
+    def retract(
+        self,
+        memory_id: str | uuid.UUID,
+        reason: str,
+        branch: str | uuid.UUID | None = None,
+    ) -> Memory:
+        """Mark a memory ``retracted`` (never deleted) and audit the reason.
+
+        As with :meth:`supersede`, retracting an *inherited* memory from a
+        descendant branch records a branch-local override instead of mutating the
+        ancestor's row.
+        """
         self._require_writable()
 
         def work(conn: psycopg.Connection) -> Memory:
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    f"UPDATE memories SET status = 'retracted' WHERE id = %s "
-                    f"RETURNING {_MEMORY_COLS}",
-                    (memory_id,),
+                    f"SELECT {_MEMORY_COLS} FROM memories WHERE id = %s", (memory_id,)
                 )
                 row = cur.fetchone()
                 if row is None:
                     raise NotFoundError(f"memory not found: {memory_id}")
+
+                acting_branch_id = (
+                    row["branch_id"] if branch is None else resolve_branch(cur, branch)["id"]
+                )
+                in_place = acting_branch_id == row["branch_id"]
+
+                if in_place:
+                    cur.execute(
+                        f"UPDATE memories SET status = 'retracted', retracted_at = now() "
+                        f"WHERE id = %s RETURNING {_MEMORY_COLS}",
+                        (memory_id,),
+                    )
+                    row = cur.fetchone()
+                else:
+                    cur.execute(
+                        "INSERT INTO memory_overrides (branch_id, memory_id, status, reason) "
+                        "VALUES (%s, %s, 'retracted', %s) "
+                        "ON CONFLICT (branch_id, memory_id) DO NOTHING",
+                        (acting_branch_id, memory_id, reason),
+                    )
+
                 audit.record(
                     conn,
                     actor=self.actor,
                     op="retract",
                     target_type="memory",
                     target_id=memory_id,
-                    payload={"reason": reason},
+                    payload={
+                        "reason": reason,
+                        "branch_id": str(acting_branch_id),
+                        "in_place": in_place,
+                    },
                 )
                 return Memory.model_validate(row)
 
         return self.db.run_in_transaction(work)
+
+    # -- branching (delegates to kernel.branching) ------------------------
+
+    def fork(self, parent_branch: str | uuid.UUID, name: str) -> Any:
+        """Fork ``parent_branch`` into a new child branch called ``name``."""
+        from kernel.branching import fork as _fork
+
+        return _fork(self.db, self.actor, parent_branch, name, read_only=self.read_only)
+
+    def commit_branch(self, branch: str | uuid.UUID) -> Any:
+        """Replay ``branch`` onto its parent; returns a ``CommitResult``."""
+        from kernel.branching import commit as _commit
+
+        return _commit(self.db, self.actor, branch, read_only=self.read_only)
+
+    def discard_branch(self, branch: str | uuid.UUID, reason: str = "") -> Any:
+        """Mark ``branch`` discarded (nothing is hard-deleted)."""
+        from kernel.branching import discard as _discard
+
+        return _discard(self.db, self.actor, branch, reason, read_only=self.read_only)
+
+    def diff_branches(self, branch_a: str | uuid.UUID, branch_b: str | uuid.UUID) -> Any:
+        """Diff two branches (added / superseded / retracted per side)."""
+        from kernel.branching import diff as _diff
+
+        return _diff(self.db, self.actor, branch_a, branch_b)
+
+    def ancestry(self, branch: str | uuid.UUID) -> Any:
+        """Resolve ``branch``'s ordered ancestry chain."""
+        from kernel.branching import resolve_ancestry
+
+        return resolve_ancestry(self.db, branch)
 
     def record_decision(
         self,
