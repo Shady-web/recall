@@ -184,6 +184,37 @@ planner full-scans). So `resolve_ancestry()` runs the recursive CTE over the tin
 `branches` table first and the resolved ids are passed as a literal list, which
 preserves index prefix spans. A regression test asserts this.
 
+## Replay & decision provenance
+
+Recall answers two different "what did we know?" questions, and **they can
+disagree — that difference is the point**:
+
+| | `replay_branch_at(branch, t)` | `replay_cluster_at(t)` |
+|---|---|---|
+| Question | what did this branch **logically contain**? | what did the cluster **physically look like**? |
+| Mechanism | validity columns (`created_at` / `superseded_at` / `retracted_at`) + ancestry | `SET TRANSACTION AS OF SYSTEM TIME` |
+| Age limit | **none** — works at any age | GC-bounded (`gc.ttlseconds`, 4h default) |
+| Use | durable replay, provenance, re-runs | forensic: true historical bytes, incl. in-place edits |
+
+`replay_window_bounds()` reports the currently safe physical-replay range, and
+`replay_cluster_at()` raises a typed `ReplayWindowExpiredError` naming that window
+rather than returning misleading data. (The raw engine error past the window is
+actively unhelpful — e.g. `database ... does not exist`.)
+
+```python
+explain_decision(db, actor, decision_id)   # what drove it + what's since invalid
+rewind_and_rerun(db, actor, decision_id, agent)              # faithful replay
+rewind_and_rerun(db, actor, decision_id, agent, as_of=now)   # decide again today
+```
+
+`explain_decision` returns each contributing memory's similarity and rank **as
+recorded at decision time** alongside its **current** status, and flags — at the
+top level — any decision resting on memory since superseded or retracted.
+
+`rewind_and_rerun` takes an **injected** agent callable, so `replay.py` stays free
+of agent/Bedrock specifics. Run `python scripts/demo_replay.py` for the full
+walkthrough.
+
 ## Benchmark
 
 `benchmarks/bench_recall.py` loads 50k synthetic memories and reports recall
@@ -224,11 +255,11 @@ database-backed tests are skipped (with a message) rather than failing.
 
 ## Status
 
-**Phase 3 — Branching engine.** Memory is branchable: `fork` / `commit` /
-`discard` / `diff`, full ancestry resolution wired into recall, structured
-commit-time conflict detection, and concurrency tests running real threads
-against a real cluster. Replay and provenance (`explain_decision`) arrive in
-Phase 4 (see `CONTEXT.md` §8).
+**Phase 4 — Replay & provenance.** Logical replay (any age) and physical
+`AS OF SYSTEM TIME` replay (GC-bounded, with a typed window guard),
+`explain_decision` with prominent invalidated-memory flags, and
+`rewind_and_rerun` against an injected agent. The MCP server arrives in Phase 5
+(see `CONTEXT.md` §8).
 
 ## License
 

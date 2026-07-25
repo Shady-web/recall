@@ -397,10 +397,22 @@ class MemoryKernel:
         action: str,
         rationale: str | None = None,
         memory_ids: list[str | uuid.UUID] | None = None,
+        recalled: list[RecallResult] | None = None,
     ) -> Decision:
-        """Record a decision and its ``decision_memories`` provenance rows."""
+        """Record a decision and its ``decision_memories`` provenance rows.
+
+        Pass ``recalled`` (the :class:`RecallResult` list the agent actually
+        acted on) to capture each memory's **similarity and rank at decision
+        time** — that is what :func:`kernel.replay.explain_decision` reports back
+        later. ``memory_ids`` remains supported for callers that only have ids;
+        those rows record rank only.
+        """
         self._require_writable()
-        memory_ids = list(memory_ids or [])
+        if recalled:
+            provenance = [(r.memory.id, r.similarity, r.rank) for r in recalled]
+        else:
+            provenance = [(m, None, i) for i, m in enumerate(list(memory_ids or []))]
+        memory_ids = [p[0] for p in provenance]
 
         def work(conn: psycopg.Connection) -> Decision:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -411,11 +423,12 @@ class MemoryKernel:
                     (b["id"], agent_id, action, rationale),
                 )
                 drow = cur.fetchone()
-                for rank, mid in enumerate(memory_ids):
+                for mid, similarity, rank in provenance:
                     cur.execute(
-                        "INSERT INTO decision_memories (decision_id, memory_id, rank) "
-                        "VALUES (%s, %s, %s)",
-                        (drow["id"], mid, rank),
+                        "INSERT INTO decision_memories "
+                        "  (decision_id, memory_id, similarity, rank) "
+                        "VALUES (%s, %s, %s, %s)",
+                        (drow["id"], mid, similarity, rank),
                     )
                 audit.record(
                     conn,

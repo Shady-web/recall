@@ -116,6 +116,45 @@ SELECT id AS branch_id, name, depth, visible_as_of FROM ancestry ORDER BY depth
 """
 
 
+def effective_status_sql(
+    alias: str, anc_alias: str = "anc", anc2_alias: str = "anc2"
+) -> str:
+    """SQL expression for a memory's status as of its ancestry segment's bound.
+
+    A branch-local override from the *nearest* ancestry branch wins; otherwise
+    the status is derived from the row's own ``superseded_at`` / ``retracted_at``
+    compared against that segment's ``visible_as_of`` bound (``NULL`` meaning
+    live/unbounded).
+
+    Shared by :mod:`kernel.recall` (what a branch sees now) and
+    :mod:`kernel.replay` (what it saw at time T) so both agree on semantics —
+    replay simply passes bounds clamped to the replay timestamp.
+    """
+    return f"""
+COALESCE(
+    (SELECT o.status
+       FROM memory_overrides o
+       JOIN {anc_alias} {anc2_alias} ON {anc2_alias}.branch_id = o.branch_id
+      WHERE o.memory_id = {alias}.id
+        AND ({anc2_alias}.visible_as_of IS NULL
+             OR o.created_at <= {anc2_alias}.visible_as_of)
+      ORDER BY {anc2_alias}.depth
+      LIMIT 1),
+    CASE
+        WHEN {alias}.retracted_at IS NOT NULL
+             AND ({anc_alias}.visible_as_of IS NULL
+                  OR {alias}.retracted_at <= {anc_alias}.visible_as_of)
+            THEN 'retracted'
+        WHEN {alias}.superseded_at IS NOT NULL
+             AND ({anc_alias}.visible_as_of IS NULL
+                  OR {alias}.superseded_at <= {anc_alias}.visible_as_of)
+            THEN 'superseded'
+        ELSE 'active'
+    END
+)
+"""
+
+
 def resolve_ancestry(
     db: Database, branch: str | uuid.UUID, conn: psycopg.Connection | None = None
 ) -> list[AncestrySegment]:

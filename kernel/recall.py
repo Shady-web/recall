@@ -46,6 +46,7 @@ from typing import Any
 from psycopg.rows import dict_row
 
 from kernel import audit
+from kernel.branching import effective_status_sql
 from kernel.db import Database
 from kernel.embeddings import EmbeddingProvider, vector_literal
 from kernel.errors import EmbeddingError
@@ -56,29 +57,9 @@ from kernel.models import Memory, RecallResult
 # compensates for candidates dropped by ancestry bounds and structured filters.
 _OVERFETCH = 8
 
-# Status of a candidate as of its segment's visibility bound. An override from
-# the nearest ancestry branch wins; otherwise fall back to the row's own
-# supersede/retract timestamps compared against the bound.
-_EFFECTIVE_STATUS = """
-COALESCE(
-    (SELECT o.status
-       FROM memory_overrides o
-       JOIN anc a2 ON a2.branch_id = o.branch_id
-      WHERE o.memory_id = c.id
-        AND (a2.visible_as_of IS NULL OR o.created_at <= a2.visible_as_of)
-      ORDER BY a2.depth
-      LIMIT 1),
-    CASE
-        WHEN c.retracted_at IS NOT NULL
-             AND (anc.visible_as_of IS NULL OR c.retracted_at <= anc.visible_as_of)
-            THEN 'retracted'
-        WHEN c.superseded_at IS NOT NULL
-             AND (anc.visible_as_of IS NULL OR c.superseded_at <= anc.visible_as_of)
-            THEN 'superseded'
-        ELSE 'active'
-    END
-)
-"""
+# Status of a candidate as of its segment's visibility bound. Shared with
+# kernel.replay so "what the branch sees now" and "what it saw at T" agree.
+_EFFECTIVE_STATUS = effective_status_sql("c")
 
 
 def build_recall_sql(

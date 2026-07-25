@@ -134,3 +134,136 @@ class BranchDiff(BaseModel):
 
     a: BranchSideDiff
     b: BranchSideDiff
+
+
+# --- Replay window -------------------------------------------------------
+
+
+class ReplayWindow(BaseModel):
+    """The range over which PHYSICAL (``AS OF SYSTEM TIME``) replay is possible.
+
+    Bounded by CockroachDB's MVCC garbage collection. Logical replay is not
+    bounded by this and works at any age.
+    """
+
+    gc_ttl_seconds: int
+    earliest: datetime
+    latest: datetime
+
+    def contains(self, t: datetime) -> bool:
+        return self.earliest <= t <= self.latest
+
+
+# --- Decision provenance -------------------------------------------------
+
+
+class ContributingMemory(BaseModel):
+    """One memory that fed a decision, then vs now.
+
+    ``similarity`` and ``rank`` are as recorded **at decision time**;
+    ``status_now`` is the memory's effective status **today** on the decision's
+    branch. ``invalidated`` is the headline signal: the agent acted on this, and
+    we have since learned it was wrong or withdrawn.
+    """
+
+    memory_id: uuid.UUID
+    content: str
+    kind: str
+    source: str | None = None
+    confidence: float
+    branch_id: uuid.UUID
+    created_at: datetime
+
+    # As recorded at decision time.
+    similarity: float | None = None
+    rank: int
+
+    # As of now.
+    status_now: str
+    invalidated: bool = False
+    superseded: bool = False
+    retracted: bool = False
+    superseded_by: uuid.UUID | None = None
+    superseded_at: datetime | None = None
+    retracted_at: datetime | None = None
+
+
+class DecisionExplanation(BaseModel):
+    """Full provenance for one decision: what drove it, and what has changed.
+
+    ``has_invalidated_memories`` / ``invalidated_memory_ids`` are deliberately
+    top-level so a UI can flag a suspect decision without walking the list.
+    """
+
+    decision: Decision
+    branch_id: uuid.UUID
+    branch_name: str
+    memories: list[ContributingMemory] = []
+
+    # Prominent flags: this decision rested on something since invalidated.
+    has_invalidated_memories: bool = False
+    invalidated_count: int = 0
+    invalidated_memory_ids: list[uuid.UUID] = []
+
+
+# --- Rewind / re-run -----------------------------------------------------
+
+
+class MemoryRef(BaseModel):
+    """Compact memory reference for diffs and UI lists."""
+
+    memory_id: uuid.UUID
+    content: str
+    kind: str
+    status: str
+
+
+class MemoryAvailabilityDiff(BaseModel):
+    """Which memories were available at decision time vs now."""
+
+    only_then: list[MemoryRef] = []   # available then, gone now (retracted/superseded)
+    only_now: list[MemoryRef] = []    # learned since the decision
+    common_count: int = 0
+    then_count: int = 0
+    now_count: int = 0
+
+
+class AgentDecision(BaseModel):
+    """Normalized return value of an injected agent callable."""
+
+    action: str
+    rationale: str | None = None
+
+
+class RerunContext(BaseModel):
+    """What an injected agent callable receives on a re-run.
+
+    ``memories`` is the branch state reconstructed at ``replayed_at`` — exactly
+    what the agent could have known when the original decision was made.
+    """
+
+    decision: Decision
+    memories: list[Memory] = []
+    replayed_at: datetime
+
+
+class RerunResult(BaseModel):
+    """Old decision vs a fresh decision made against reconstructed context."""
+
+    decision_id: uuid.UUID
+    branch_id: uuid.UUID
+    branch_name: str
+    decision_at: datetime
+    # Which reconstructed state the agent was actually run against. Defaults to
+    # `decision_at` (faithful replay); set to a later time to ask "given what we
+    # know now, would it still decide this?".
+    evaluated_at: datetime
+
+    old_action: str
+    old_rationale: str | None = None
+    new_action: str
+    new_rationale: str | None = None
+    action_changed: bool = False
+
+    memory_diff: MemoryAvailabilityDiff
+    contributing_memory_ids: list[uuid.UUID] = []
