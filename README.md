@@ -90,6 +90,21 @@ Some ccloud subcommand flags (service-account, api-key, backup config) are marke
 with `TODO(verify)` in `infra/provision.sh` pending confirmation against the live
 CLI — see the comments in that script.
 
+## Database schema & migrations
+
+The schema (`branches`, `memories`, `decisions`, `decision_memories`,
+`audit_log`) lives in `migrations/` as numbered SQL files. Apply them with the
+migration runner, which is idempotent and safe to re-run:
+
+```bash
+python -m kernel.migrate                 # uses CRDB_CONNECTION_STRING
+python -m kernel.migrate --dsn <dsn>     # explicit target
+```
+
+`memories.embedding` is `VECTOR(1024)` (matching Amazon Titan Text Embeddings V2)
+but is left nullable and unindexed until Phase 2. The runner seeds a root branch
+named `main`.
+
 ## Development
 
 ```bash
@@ -100,11 +115,31 @@ pytest          # tests
 CI runs ruff + pytest on every push and pull request
 (see `.github/workflows/ci.yml`).
 
+### Running the tests
+
+The kernel tests run against a **live CockroachDB instance** (v25.2+, for the
+`VECTOR` type). A local insecure single-node is fine:
+
+```bash
+docker run -d --name recall-crdb -p 26257:26257 \
+    cockroachdb/cockroach:latest-v25.2 start-single-node --insecure
+
+# point the tests at it (this is the default if unset)
+export RECALL_TEST_DSN="postgresql://root@localhost:26257/defaultdb?sslmode=disable"
+pytest
+```
+
+Each test creates its own fresh, migrated database and drops it on teardown, so
+runs are isolated. If no cluster is reachable at `RECALL_TEST_DSN`, the
+database-backed tests are skipped (with a message) rather than failing.
+
 ## Status
 
-**Phase 0 — Scaffolding.** Repo structure, config, connection/retry plumbing, CI,
-and infra scripts are in place. No schema, memory model, or Bedrock code yet;
-those arrive in Phase 1 and beyond (see `CONTEXT.md` §8).
+**Phase 1 — Schema & kernel core.** Migrations, the migration runner, pydantic
+models, and the non-semantic memory API (`remember` / `get` / `list_memories` /
+`supersede` / `retract` / `record_decision`) are in place, each writing an audit
+row in the same transaction as the operation. No embeddings, vector search, or
+branching yet — those arrive in Phase 2+ (see `CONTEXT.md` §8).
 
 ## License
 

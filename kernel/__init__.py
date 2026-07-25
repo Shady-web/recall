@@ -5,4 +5,4 @@ Every other component (MCP server, agent, UI backend) must go through the
 kernel. If a component outside this package writes SQL directly, that is a bug.
 """
 
-__all__ = ["config", "db"]
+__all__ = ["audit", "config", "db", "errors", "memory", "migrate", "models"]
