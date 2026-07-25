@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Prepare env for config import
+        # kernel.config reads a .env file; copy the checked-in example so imports
+        # and tests that touch the module have well-formed placeholder values.
+        run: cp .env.example .env
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Pytest
+        run: pytest -q
+
+      - name: Smoke-check config loads
+        run: python -c "from kernel.config import settings; print(settings)"
