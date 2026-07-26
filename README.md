@@ -253,6 +253,58 @@ Each test creates its own fresh, migrated database and drops it on teardown, so
 runs are isolated. If no cluster is reachable at `RECALL_TEST_DSN`, the
 database-backed tests are skipped (with a message) rather than failing.
 
+### CockroachDB Cloud MCP server — read-only, by design
+
+We use the **managed CockroachDB Cloud MCP server** during development so Claude
+Code can inspect the live cluster directly — schema and index definitions,
+`EXPLAIN` output, zone configuration, table statistics. It is what let us verify
+empirically (rather than assume) that `VECTOR(1024)` is indexable, that
+`AS OF SYSTEM TIME` cannot be nested in a CTE, and that ancestry-scoped recall
+still plans as a `vector search`.
+
+Register it with:
+
+```bash
+claude mcp add cockroachdb-cloud https://cockroachlabs.cloud/mcp \
+  --transport http \
+  --header "mcp-cluster-id: <your-cluster-id>" \
+  --scope user
+```
+
+then authenticate with `/mcp` inside Claude Code.
+
+**It is used for reads only. Every write goes through `kernel/`.**
+
+This is a deliberate access-control decision, not a convention we hope people
+follow. Recall's core guarantee is that *every* state change is attributable:
+each kernel operation writes an `audit_log` row **in the same transaction** as
+the operation itself, so an operation cannot commit without its audit record.
+A direct `INSERT`/`UPDATE`/`DELETE` issued through a general-purpose SQL tool
+bypasses that path entirely — it would mutate the system of record while leaving
+no actor, no operation, and no provenance behind. Worse, it would do so
+*invisibly*: nothing downstream could distinguish an unaudited change from one
+that never happened, which quietly falsifies replay and
+`explain_decision` for every decision that touched the affected memory.
+
+So the rule is structural rather than advisory:
+
+| Path | Allowed operations | Audited |
+|---|---|---|
+| `kernel/` (the only SQL in the project) | read + write | yes — same transaction |
+| Cloud MCP server | schema/plan/config **inspection** | n/a — reads only |
+| Anything else talking SQL directly | none | — this is a bug |
+
+Two properties make the boundary enforceable rather than aspirational:
+`MemoryKernel` cannot be constructed without an `actor`, so no write path can run
+unattributed; and `RECALL_READ_ONLY=true` makes every write path raise
+`ReadOnlyError` before touching the database, which is the setting to use for any
+inspection-oriented session or shared credential.
+
+For cluster *operations* — provisioning, backup configuration, audit-log export —
+the scripted path is `infra/` via the ccloud CLI, not ad-hoc MCP calls, so
+infrastructure changes are reviewable in version control alongside everything
+else.
+
 ## Status
 
 **Phase 4 — Replay & provenance.** Logical replay (any age) and physical
