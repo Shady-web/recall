@@ -54,7 +54,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import psycopg
 from psycopg.rows import dict_row
@@ -75,6 +75,7 @@ from kernel.models import (
     ReplayWindow,
     RerunContext,
     RerunResult,
+    RewindSummary,
 )
 
 logger = logging.getLogger("recall.kernel.replay")
@@ -453,33 +454,24 @@ def _ref(m: Memory) -> MemoryRef:
     )
 
 
-def rewind_and_rerun(
-    db: Database,
-    actor: str,
-    decision_id: str | uuid.UUID,
-    agent: Callable[[RerunContext], Any],
-    *,
-    as_of: datetime | None = None,
-) -> RerunResult:
-    """Reconstruct the branch as of a decision and re-run an agent against it.
+class _RewindState(NamedTuple):
+    """What both rewind paths need before they diverge."""
 
-    The branch state is rebuilt with **logical** replay, so this works
-    regardless of the decision's age. ``agent`` is injected and receives a
-    :class:`RerunContext`; the kernel knows nothing about how it reaches a
-    decision.
+    decision: dict[str, Any]
+    contributing: list[uuid.UUID]
+    then: list[Memory]
+    now: list[Memory]
+    window: ReplayWindow
+    diff: MemoryAvailabilityDiff
 
-    ``as_of`` selects which reconstructed state the agent runs against:
 
-    * **default (the decision's timestamp)** — faithful replay. A deterministic
-      agent reproduces the original action, which is the fidelity check; a
-      *changed* agent reveals how a new version would have handled a past
-      incident.
-    * **a later time (e.g. now)** — "given what we have learned since, would it
-      still decide this?". This is what flips the action when a supporting
-      memory has been retracted or superseded.
+def _rewind_state(db: Database, actor: str, decision_id: str | uuid.UUID) -> _RewindState:
+    """Reconstruct the shared rewind context: the decision, its provenance, and
+    the branch as it was at decision time vs now.
 
-    Either way the returned ``memory_diff`` always compares decision time
-    against now, so the caller can see exactly what changed.
+    Shared by :func:`rewind_summary` (which stops here) and
+    :func:`rewind_and_rerun` (which then runs an agent against it), so the two
+    can never drift on what "then" and "now" mean.
     """
     with db.transaction(read_only=True) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -508,13 +500,95 @@ def rewind_and_rerun(
         then_count=len(then),
         now_count=len(now_memories),
     )
+    return _RewindState(d, contributing, then, now_memories, now_window, diff)
+
+
+def rewind_summary(
+    db: Database,
+    actor: str,
+    decision_id: str | uuid.UUID,
+) -> RewindSummary:
+    """Rewind to a decision and report what changed — **without re-running any agent**.
+
+    This is :func:`rewind_and_rerun` minus the agent: the branch is rebuilt with
+    logical replay (so it works at any age) and the then-vs-now memory
+    availability diff is returned, but nothing is invoked and no new decision is
+    produced. Callers that must not trigger a model call as a side effect of a
+    read should use this.
+    """
+    state = _rewind_state(db, actor, decision_id)
+    d, diff = state.decision, state.diff
+
+    summary = RewindSummary(
+        decision_id=d["id"],
+        branch_id=d["branch_id"],
+        branch_name=d["branch_name"],
+        decision_at=d["created_at"],
+        replayed_at=d["created_at"],
+        action=d["action"],
+        rationale=d["rationale"],
+        memories_at_decision=[_ref(m) for m in state.then],
+        memory_diff=diff,
+        contributing_memory_ids=state.contributing,
+    )
+
+    def audit_work(conn: psycopg.Connection) -> None:
+        audit.record(
+            conn,
+            actor=actor,
+            op="rewind_summary",
+            target_type="decision",
+            target_id=d["id"],
+            payload={
+                "replayed_at": summary.replayed_at.isoformat(),
+                "memories_then": diff.then_count,
+                "memories_now": diff.now_count,
+                "only_then": len(diff.only_then),
+                "only_now": len(diff.only_now),
+            },
+        )
+
+    db.run_in_transaction(audit_work)
+    return summary
+
+
+def rewind_and_rerun(
+    db: Database,
+    actor: str,
+    decision_id: str | uuid.UUID,
+    agent: Callable[[RerunContext], Any],
+    *,
+    as_of: datetime | None = None,
+) -> RerunResult:
+    """Reconstruct the branch as of a decision and re-run an agent against it.
+
+    The branch state is rebuilt with **logical** replay, so this works
+    regardless of the decision's age. ``agent`` is injected and receives a
+    :class:`RerunContext`; the kernel knows nothing about how it reaches a
+    decision.
+
+    ``as_of`` selects which reconstructed state the agent runs against:
+
+    * **default (the decision's timestamp)** — faithful replay. A deterministic
+      agent reproduces the original action, which is the fidelity check; a
+      *changed* agent reveals how a new version would have handled a past
+      incident.
+    * **a later time (e.g. now)** — "given what we have learned since, would it
+      still decide this?". This is what flips the action when a supporting
+      memory has been retracted or superseded.
+
+    Either way the returned ``memory_diff`` always compares decision time
+    against now, so the caller can see exactly what changed.
+    """
+    state = _rewind_state(db, actor, decision_id)
+    d, now_window, diff = state.decision, state.window, state.diff
 
     decision = Decision.model_validate(d)
     evaluated_at = as_of if as_of is not None else d["created_at"]
     if as_of is None:
-        context_memories = then
+        context_memories = state.then
     elif as_of == now_window.latest:
-        context_memories = now_memories
+        context_memories = state.now
     else:
         context_memories = replay_branch_at(
             db, actor, d["branch_id"], as_of, audit_op="rewind_replay"
@@ -539,7 +613,7 @@ def rewind_and_rerun(
         new_rationale=new.rationale,
         action_changed=new.action != d["action"],
         memory_diff=diff,
-        contributing_memory_ids=contributing,
+        contributing_memory_ids=state.contributing,
     )
 
     def audit_work(conn: psycopg.Connection) -> None:

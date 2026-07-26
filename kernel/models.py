@@ -228,6 +228,32 @@ class MemoryAvailabilityDiff(BaseModel):
     now_count: int = 0
 
 
+class RewindSummary(BaseModel):
+    """A rewind with **no agent re-run**: what the branch knew then vs now.
+
+    This is the read-only half of :func:`kernel.replay.rewind_and_rerun` — the
+    logical replay and the availability diff, without invoking any agent. It
+    exists so callers that must not trigger a re-run (notably the MCP server,
+    where a tool call must never fire a model call as a side effect) can still
+    ask "what did this decision rest on, and what has changed since?".
+    """
+
+    decision_id: uuid.UUID
+    branch_id: uuid.UUID
+    branch_name: str
+    decision_at: datetime
+    # The reconstructed state the summary is reported against. Defaults to
+    # `decision_at` (faithful rewind).
+    replayed_at: datetime
+
+    action: str
+    rationale: str | None = None
+
+    memories_at_decision: list[MemoryRef] = []
+    memory_diff: MemoryAvailabilityDiff
+    contributing_memory_ids: list[uuid.UUID] = []
+
+
 class AgentDecision(BaseModel):
     """Normalized return value of an injected agent callable."""
 
