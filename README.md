@@ -230,8 +230,10 @@ walkthrough.
 
 `mcp_server/` exposes the kernel over the Model Context Protocol (official Python
 MCP SDK, stdio transport), so Recall is usable directly from Claude Code, Cursor,
-and VS Code. This is **our** server — distinct from the managed CockroachDB Cloud
-MCP server, which we use during development to introspect the live cluster.
+and VS Code. This is **our** server — distinct from the
+[managed CockroachDB Cloud MCP server](#cockroachdb-cloud-mcp-server-the-managed-one--read-only-by-design),
+which we use during development to introspect the live cluster, and which is
+read-only by design.
 
 ```bash
 python -m mcp_server        # serve over stdio
@@ -384,55 +386,7 @@ for any session you do not want writing to the team's `main` branch — set
 **Do not commit a config containing a real connection string.** Keep the
 populated file local, or reference a variable your shell already exports.
 
-## Benchmark
-
-`benchmarks/bench_recall.py` loads 50k synthetic memories and reports recall
-latency (p50/p95/p99). It uses the fake provider, so it needs no AWS. Committed
-results live in [`benchmarks/recall_benchmark.md`](./benchmarks/recall_benchmark.md).
-
-```bash
-python benchmarks/bench_recall.py --count 50000 --queries 300
-```
-
-## Development
-
-```bash
-ruff check .    # lint
-pytest          # tests
-```
-
-CI runs ruff + pytest on every push and pull request against a **real
-CockroachDB** started by `scripts/dev_db.sh` — the same path you use locally, so
-a green CI run means the database-backed tests actually executed rather than
-skipped (see `.github/workflows/ci.yml`).
-
-### Running the tests
-
-The kernel tests run against a **live CockroachDB instance** (for the `VECTOR`
-type). Start a local one and run them — no environment variable needed, the
-tests already default to it:
-
-```bash
-./scripts/dev_db.sh up      # local single-node in Docker
-pytest                      # 119 passed, 2 skipped, ~3.5 min
-```
-
-Each test creates its own fresh, migrated database and drops it on teardown, so
-runs are isolated.
-
-Point `RECALL_TEST_DSN` at the cloud cluster instead when you specifically want
-to prove something there — expect **hours**, not minutes, because each test
-rebuilds the vector index over the network (~92s per test vs ~2s locally).
-
-**A skip is not a pass.** When no cluster is reachable the database-backed tests
-*skip* rather than fail, so a misconfigured connection makes the suite exit 0
-having run almost nothing. Run `pytest -ra` and check the counts: anything other
-than 119 passed / 2 skipped means the tests are not reaching a cluster.
-
-Full details — local vs cloud, Bedrock integration tests, troubleshooting — are
-in **[DEV_SETUP.md](./DEV_SETUP.md)**.
-
-### CockroachDB Cloud MCP server — read-only, by design
+## CockroachDB Cloud MCP server (the managed one) — read-only, by design
 
 We use the **managed CockroachDB Cloud MCP server** during development so Claude
 Code can inspect the live cluster directly — schema and index definitions,
@@ -483,6 +437,54 @@ For cluster *operations* — provisioning, backup configuration, audit-log expor
 the scripted path is `infra/` via the ccloud CLI, not ad-hoc MCP calls, so
 infrastructure changes are reviewable in version control alongside everything
 else.
+
+## Benchmark
+
+`benchmarks/bench_recall.py` loads 50k synthetic memories and reports recall
+latency (p50/p95/p99). It uses the fake provider, so it needs no AWS. Committed
+results live in [`benchmarks/recall_benchmark.md`](./benchmarks/recall_benchmark.md).
+
+```bash
+python benchmarks/bench_recall.py --count 50000 --queries 300
+```
+
+## Development
+
+```bash
+ruff check .    # lint
+pytest          # tests
+```
+
+CI runs ruff + pytest on every push and pull request against a **real
+CockroachDB** started by `scripts/dev_db.sh` — the same path you use locally, so
+a green CI run means the database-backed tests actually executed rather than
+skipped (see `.github/workflows/ci.yml`).
+
+### Running the tests
+
+The kernel tests run against a **live CockroachDB instance** (for the `VECTOR`
+type). Start a local one and run them — no environment variable needed, the
+tests already default to it:
+
+```bash
+./scripts/dev_db.sh up      # local single-node in Docker
+pytest                      # 119 passed, 2 skipped, ~3.5 min
+```
+
+Each test creates its own fresh, migrated database and drops it on teardown, so
+runs are isolated.
+
+Point `RECALL_TEST_DSN` at the cloud cluster instead when you specifically want
+to prove something there — expect **hours**, not minutes, because each test
+rebuilds the vector index over the network (~92s per test vs ~2s locally).
+
+**A skip is not a pass.** When no cluster is reachable the database-backed tests
+*skip* rather than fail, so a misconfigured connection makes the suite exit 0
+having run almost nothing. Run `pytest -ra` and check the counts: anything other
+than 119 passed / 2 skipped means the tests are not reaching a cluster.
+
+Full details — local vs cloud, Bedrock integration tests, troubleshooting — are
+in **[DEV_SETUP.md](./DEV_SETUP.md)**.
 
 ## Status
 
