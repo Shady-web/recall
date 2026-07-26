@@ -21,7 +21,14 @@ what provenance and re-runs are built on.
 It uses ``SET TRANSACTION AS OF SYSTEM TIME``, so it sees the true historical
 bytes: rows as they were before any in-place edit, including changes that left
 no logical trace. This is the forensic path. It is bounded by MVCC garbage
-collection (``gc.ttlseconds``, 4h by default), so it only reaches back so far.
+collection: how far back it reaches is set by the cluster's ``gc.ttlseconds``,
+which :func:`replay_window_bounds` reads **live from the zone config on every
+call** rather than assuming a value. Clusters differ — a CockroachDB Cloud Basic
+cluster reports 4500s (75 min), the self-hosted default is 14400s (4h) — so
+never hard-code an expected window. If that live read fails, the code falls back
+to a deliberately conservative :data:`_DEFAULT_GC_TTL_SECONDS`, which
+under-promises the window: better to refuse a replay the cluster would have
+served than to promise one it will reject.
 
 **Where they differ.** Suppose a memory's ``content`` was corrected in place by
 an operator. Logical replay shows the corrected text (that is the row Recall
@@ -42,6 +49,7 @@ takes an injected callable. The kernel remains pure.
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from collections.abc import Callable
@@ -69,9 +77,16 @@ from kernel.models import (
     RerunResult,
 )
 
-# CockroachDB's default gc.ttlseconds, used only if the zone config cannot be
-# read (e.g. restricted role). Deliberately conservative.
-_DEFAULT_GC_TTL_SECONDS = 14400
+logger = logging.getLogger("recall.kernel.replay")
+
+# Fallback used ONLY when the live zone config cannot be read (e.g. a restricted
+# role). Deliberately far shorter than any real cluster's gc.ttlseconds so a
+# failed read under-promises the window instead of over-promising it: claiming a
+# window wider than reality would wave through timestamps the cluster then
+# refuses, which is the failure this guard exists to prevent. Observed real
+# values vary widely (a CockroachDB Cloud Basic cluster reports 4500s; the
+# self-hosted default is 14400s), so there is no safe "typical" value to assume.
+_DEFAULT_GC_TTL_SECONDS = 600
 
 _GC_TTL_RE = re.compile(r"gc\.ttlseconds\s*=\s*(\d+)")
 
@@ -93,13 +108,30 @@ def replay_window_bounds(db: Database) -> ReplayWindow:
             row = conn.execute(
                 "SHOW ZONE CONFIGURATION FOR TABLE memories"
             ).fetchone()
-            if row is not None:
-                match = _GC_TTL_RE.search(str(row[1]))
-                if match:
-                    ttl = int(match.group(1))
-        except Exception:
-            # Zone config unreadable — fall back to the documented default.
-            pass
+            match = _GC_TTL_RE.search(str(row[1])) if row is not None else None
+            if match:
+                ttl = int(match.group(1))
+            else:
+                # Read succeeded but yielded no gc.ttlseconds — same silent-narrowing
+                # risk as an outright failure, so it warns too.
+                logger.warning(
+                    "could not parse gc.ttlseconds from the zone configuration for "
+                    "table 'memories'; using the conservative fallback of %ds. "
+                    "Physical replay will refuse anything older than that, which may "
+                    "be far narrower than this cluster's real GC window.",
+                    _DEFAULT_GC_TTL_SECONDS,
+                )
+        except Exception as exc:
+            logger.warning(
+                "live read of gc.ttlseconds failed (%s: %s); using the conservative "
+                "fallback of %ds. Physical replay will refuse anything older than "
+                "that, so replay_cluster_at() may raise ReplayWindowExpiredError for "
+                "timestamps it previously served. Check that this role can run "
+                "SHOW ZONE CONFIGURATION.",
+                type(exc).__name__,
+                exc,
+                _DEFAULT_GC_TTL_SECONDS,
+            )
         now = conn.execute("SELECT now()").fetchone()[0]
         return ReplayWindow(
             gc_ttl_seconds=ttl,

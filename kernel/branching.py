@@ -55,9 +55,10 @@ point. That is not implementable on CockroachDB, verified empirically:
     ``AS OF SYSTEM TIME must be provided on a top-level statement``. One
     statement therefore cannot read different ancestry segments at different
     timestamps — which is precisely what per-fork-point AOST requires.
-  * AOST cannot look back past MVCC garbage collection
-    (``gc.ttlseconds`` default 14400 = 4h), so any branch outliving the GC
-    window would become unreadable.
+  * AOST cannot look back past MVCC garbage collection. The reach is the
+    cluster's ``gc.ttlseconds`` and varies by deployment (CockroachDB Cloud
+    Basic reports 4500s = 75 min; the self-hosted default is 14400s = 4h), so
+    any branch outliving that window would become unreadable.
 
 Instead we use **logical time-travel**: each ancestry segment is bounded by
 ``created_at <= visible_as_of``, and status changes carry their own timestamps

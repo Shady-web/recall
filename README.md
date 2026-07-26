@@ -165,8 +165,10 @@ v25.2:
   one arm of a `UNION` it fails with `AS OF SYSTEM TIME must be provided on a
   top-level statement` — so one statement cannot read different ancestry
   segments at different timestamps.
-- AOST cannot look back past MVCC garbage collection (`gc.ttlseconds`, default
-  4h), so a branch outliving the GC window would become unreadable.
+- AOST cannot look back past MVCC garbage collection. The reach is the cluster's
+  `gc.ttlseconds` and varies by deployment (CockroachDB Cloud Basic reports
+  4500s = 75 min; the self-hosted default is 14400s = 4h), so a branch outliving
+  that window would become unreadable.
 
 Ancestry therefore bounds each segment with `created_at <= fork_point`, and
 status changes carry timestamps (`superseded_at` / `retracted_at`, migration
@@ -193,7 +195,7 @@ disagree — that difference is the point**:
 |---|---|---|
 | Question | what did this branch **logically contain**? | what did the cluster **physically look like**? |
 | Mechanism | validity columns (`created_at` / `superseded_at` / `retracted_at`) + ancestry | `SET TRANSACTION AS OF SYSTEM TIME` |
-| Age limit | **none** — works at any age | GC-bounded (`gc.ttlseconds`, 4h default) |
+| Age limit | **none** — works at any age | GC-bounded (`gc.ttlseconds`, read live per-cluster) |
 | Use | durable replay, provenance, re-runs | forensic: true historical bytes, incl. in-place edits |
 
 `replay_window_bounds()` reports the currently safe physical-replay range, and

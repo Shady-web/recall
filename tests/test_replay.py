@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
 import psycopg
 import pytest
 
+from kernel import replay as replay_module
 from kernel.branching import fork
 from kernel.errors import ReplayWindowExpiredError
 from kernel.replay import (
@@ -68,7 +70,7 @@ def test_logical_replay_works_for_a_branch_older_than_the_gc_window(db, kernel, 
     could not answer this at all (see the GC-window test below).
     """
     window = replay_window_bounds(db)
-    old = window.latest - timedelta(hours=10)  # well outside the 4h GC window
+    old = window.latest - timedelta(hours=10)  # outside any realistic GC window
 
     with psycopg.connect(test_dsn, autocommit=True) as conn:
         branch_id = conn.execute("SELECT id FROM branches WHERE name='main'").fetchone()[0]
@@ -96,6 +98,72 @@ def test_replay_window_bounds_reports_the_gc_ttl(db):
     assert w.earliest < w.latest
     assert w.contains(w.latest)
     assert not w.contains(w.earliest - timedelta(seconds=1))
+
+
+def test_gc_read_failure_falls_back_conservatively_and_warns(db, monkeypatch, caplog):
+    """A failed live read must narrow the window and say so, not fail silently.
+
+    The fallback is only reachable when the zone-config read breaks, which never
+    happens under a normal test role — so it is forced here. Without this test the
+    600s path and its warning are dead code as far as CI is concerned.
+    """
+
+    class _Boom:
+        def search(self, _text):
+            raise RuntimeError("simulated permission denial")
+
+    monkeypatch.setattr(replay_module, "_GC_TTL_RE", _Boom())
+
+    with caplog.at_level(logging.WARNING, logger="recall.kernel.replay"):
+        window = replay_window_bounds(db)
+
+    # The window must narrow to the conservative fallback, never widen.
+    assert window.gc_ttl_seconds == replay_module._DEFAULT_GC_TTL_SECONDS
+    assert window.gc_ttl_seconds == 600, (
+        "the fallback must stay far below any real cluster's gc.ttlseconds so a "
+        "failed read under-promises the replay window rather than over-promising it"
+    )
+    assert (window.latest - window.earliest).total_seconds() == 600
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one warning, got {warnings}"
+    msg = warnings[0].getMessage()
+    assert "gc.ttlseconds" in msg
+    assert "600" in msg  # names the value actually in force
+    assert "SHOW ZONE CONFIGURATION" in msg  # points at the likely cause
+    assert "simulated permission denial" in msg  # carries the underlying error
+
+
+def test_gc_parse_miss_falls_back_conservatively_and_warns(db, monkeypatch, caplog):
+    """A read that succeeds but yields no gc.ttlseconds must warn too.
+
+    Distinct from the failure above: no exception is raised, so an earlier version
+    of this code narrowed the window in complete silence.
+    """
+    import re
+
+    monkeypatch.setattr(
+        replay_module, "_GC_TTL_RE", re.compile(r"never_matches_anything_(\d+)")
+    )
+
+    with caplog.at_level(logging.WARNING, logger="recall.kernel.replay"):
+        window = replay_window_bounds(db)
+
+    assert window.gc_ttl_seconds == 600
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly one warning, got {warnings}"
+    assert "could not parse gc.ttlseconds" in warnings[0].getMessage()
+
+
+def test_gc_read_success_is_silent(db, caplog):
+    """The normal path must stay quiet — a warning per call would be noise."""
+    with caplog.at_level(logging.WARNING, logger="recall.kernel.replay"):
+        window = replay_window_bounds(db)
+    assert window.gc_ttl_seconds != replay_module._DEFAULT_GC_TTL_SECONDS, (
+        "live read did not win; this cluster's role may not read zone configs, "
+        "which would make the two fallback tests above vacuous"
+    )
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
 
 
 def test_physical_replay_reads_historical_cluster_state(db, kernel, test_dsn):
