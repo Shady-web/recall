@@ -149,17 +149,43 @@ def main() -> None:
 
         hr("7. GC-window honesty")
         w = replay_window_bounds(db)
+        ancient = w.earliest - timedelta(hours=1)
+
+        # Demo staging only (not part of the kernel's behaviour): everything above
+        # was created seconds ago, so without this there is nothing for logical
+        # replay to *find* an hour past the window and the contrast below lands as
+        # "0 memories". Backdate one row so the point is visible. Same technique as
+        # tests/test_replay.py::test_logical_replay_works_for_a_branch_older_than_
+        # the_gc_window.
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            branch_id = conn.execute(
+                "SELECT id FROM branches WHERE name = 'main'"
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT INTO memories (branch_id, kind, content, created_at) "
+                "VALUES (%s, 'fact', %s, %s)",
+                (
+                    branch_id,
+                    "the alpha cluster was decommissioned",
+                    ancient - timedelta(minutes=30),
+                ),
+            )
+
         print(f"    gc.ttlseconds = {w.gc_ttl_seconds}")
         print(f"    physical replay safe from {w.earliest:%Y-%m-%d %H:%M:%S} "
               f"to {w.latest:%Y-%m-%d %H:%M:%S}")
+        print(f"    (backdated one memory to {ancient - timedelta(minutes=30):%H:%M:%S}, "
+              f"outside that window, so the contrast below is visible)")
         try:
-            replay_cluster_at(db, "demo", w.earliest - timedelta(hours=1))
+            replay_cluster_at(db, "demo", ancient)
         except ReplayWindowExpiredError as exc:
             print("\n    replay_cluster_at() 1h past the window:")
             print(f"      ReplayWindowExpiredError: {str(exc)[:150]}...")
-        old_logical = replay_branch_at(db, "demo", "main", w.earliest - timedelta(hours=1))
+        old_logical = replay_branch_at(db, "demo", "main", ancient)
         print(f"\n    replay_branch_at() at the same instant: OK "
               f"({len(old_logical)} memories) -- logical replay is not GC-bounded")
+        for m in old_logical:
+            print(f"      recovered: {m.content}")
 
         hr("8. Audit log")
         with psycopg.connect(dsn) as conn:

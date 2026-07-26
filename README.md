@@ -38,7 +38,7 @@ cache.
 ```
 recall/
   kernel/       Memory kernel — the ONLY component that talks SQL to CockroachDB
-  mcp_server/   Recall MCP server (thin wrapper over the kernel) — Phase 5
+  mcp_server/   Recall MCP server (thin wrapper over the kernel)
   agent/        Demo DevOps incident-triage agent (Lambda) — Phase 6
   ui/           Web UI: timeline scrubber + branch tree — Phase 6
   infra/        ccloud provisioning + audit export scripts
@@ -51,7 +51,7 @@ Architectural rule: **the kernel is never bypassed.** If any component outside
 
 ## Setup
 
-Requires **Python 3.12+**.
+Requires **Python 3.12+** and Docker (for the local test cluster).
 
 ```bash
 # 1. Create a virtualenv and install (with dev tools)
@@ -59,13 +59,20 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 
-# 2. Configure environment
+# 2. Start a local CockroachDB and run the tests
+./scripts/dev_db.sh up
+pytest
+
+# 3. To talk to the real cloud cluster, configure the environment
 cp .env.example .env
 # edit .env and fill in your real CRDB_CONNECTION_STRING and AWS settings
 ```
 
 `.env` is git-ignored. Never commit real secrets — only `.env.example` with
 placeholders is checked in.
+
+Local cluster for development and tests, CockroachDB Cloud for integration
+checks and the demo — see **[DEV_SETUP.md](./DEV_SETUP.md)** for both.
 
 ### Environment variables
 
@@ -77,6 +84,8 @@ placeholders is checked in.
 | `BEDROCK_REASONING_MODEL` | Bedrock model id for agent reasoning |
 | `RECALL_ACTOR_ID` | Identity stamped on every audit-log row |
 | `RECALL_READ_ONLY` | When true, kernel permits reads only |
+| `RECALL_MCP_ACTOR` | MCP server identity (default: `RECALL_ACTOR_ID`); always prefixed `mcp:` |
+| `RECALL_MCP_SERVER_NAME` | Name the MCP server advertises (default: `recall`) |
 
 ## Provisioning the cluster
 
@@ -165,8 +174,10 @@ v25.2:
   one arm of a `UNION` it fails with `AS OF SYSTEM TIME must be provided on a
   top-level statement` — so one statement cannot read different ancestry
   segments at different timestamps.
-- AOST cannot look back past MVCC garbage collection (`gc.ttlseconds`, default
-  4h), so a branch outliving the GC window would become unreadable.
+- AOST cannot look back past MVCC garbage collection. The reach is the cluster's
+  `gc.ttlseconds` and varies by deployment (CockroachDB Cloud Basic reports
+  4500s = 75 min; the self-hosted default is 14400s = 4h), so a branch outliving
+  that window would become unreadable.
 
 Ancestry therefore bounds each segment with `created_at <= fork_point`, and
 status changes carry timestamps (`superseded_at` / `retracted_at`, migration
@@ -193,7 +204,7 @@ disagree — that difference is the point**:
 |---|---|---|
 | Question | what did this branch **logically contain**? | what did the cluster **physically look like**? |
 | Mechanism | validity columns (`created_at` / `superseded_at` / `retracted_at`) + ancestry | `SET TRANSACTION AS OF SYSTEM TIME` |
-| Age limit | **none** — works at any age | GC-bounded (`gc.ttlseconds`, 4h default) |
+| Age limit | **none** — works at any age | GC-bounded (`gc.ttlseconds`, read live per-cluster) |
 | Use | durable replay, provenance, re-runs | forensic: true historical bytes, incl. in-place edits |
 
 `replay_window_bounds()` reports the currently safe physical-replay range, and
@@ -215,6 +226,164 @@ top level — any decision resting on memory since superseded or retracted.
 of agent/Bedrock specifics. Run `python scripts/demo_replay.py` for the full
 walkthrough.
 
+## MCP server
+
+`mcp_server/` exposes the kernel over the Model Context Protocol (official Python
+MCP SDK, stdio transport), so Recall is usable directly from Claude Code, Cursor,
+and VS Code. This is **our** server — distinct from the managed CockroachDB Cloud
+MCP server, which we use during development to introspect the live cluster.
+
+```bash
+python -m mcp_server        # serve over stdio
+```
+
+### Tools
+
+| Tool | Kind | Kernel entry point | Returns |
+|---|---|---|---|
+| `remember(branch, content, kind, source, confidence)` | write | `MemoryKernel.remember` | the stored memory |
+| `recall(branch, query, k, filters)` | read | `MemoryKernel.recall` | hits with similarity + rank |
+| `branch(parent, name)` | write | `branching.fork` | the new branch |
+| `commit(branch)` | write | `branching.commit` | commit result, or structured conflicts |
+| `discard(branch, reason)` | write | `branching.discard` | the discarded branch |
+| `diff(branch_a, branch_b)` | read | `branching.diff` | added / superseded / retracted per side |
+| `explain_decision(decision_id)` | read | `replay.explain_decision` | contributing memories + invalidation flags |
+| `rewind(decision_id)` | read | `replay.rewind_summary` | logical replay summary + then-vs-now diff |
+
+Each tool does exactly four things: validate its arguments, refuse the call if it
+is a write on a read-only server, call **one** kernel entry point, serialize the
+result. No SQL, no business logic, no state.
+
+`rewind` is deliberately the *summary* path, not `rewind_and_rerun` — a tool call
+must never fire an agent (and therefore a model call) as a side effect of what
+the caller asked to be a read. To re-run an agent, call
+`kernel.replay.rewind_and_rerun` directly.
+
+### Everything is structured JSON
+
+Two shapes, never prose and never a stack trace:
+
+```json
+{"ok": true,  "tool": "remember", "data": {"memory": {"id": "…", "kind": "fact"}}}
+{"ok": false, "tool": "recall",   "error": {"type": "not_found",
+                                            "message": "branch not found: nope",
+                                            "retryable": false, "details": {}}}
+```
+
+`error.type` is a closed vocabulary — `read_only`, `not_found`, `invalid_state`,
+`invalid_input`, `embedding_failed`, `replay_window_expired`, `internal` — so a
+client can branch on it programmatically. Unexpected exceptions are logged with
+their traceback *server-side only* and reported as `internal`.
+
+**Commit conflicts are not errors.** A conflicting `commit` returns `ok: true`
+with `committed: false`, `conflict_count > 0`, and a structured `conflicts` list;
+the commit is a no-op and the branch stays open. A conflict is an outcome to
+resolve, not a failure.
+
+### Safety
+
+- **Read-only mode.** With `RECALL_READ_ONLY=true`, the four write tools stay
+  listed but return a typed `read_only` error, and their descriptions are
+  prefixed so a model knows before calling. Hiding them would be simpler, but an
+  agent that cannot see a tool concludes the capability does not exist and
+  silently works around it; one that gets a clear refusal reports the real
+  reason. The refusal is enforced at the MCP boundary *and* again in the kernel.
+- **Audit identity.** Tools call the same kernel functions a direct Python caller
+  would, so every operation still writes its audit row in the same transaction as
+  the operation. What MCP adds is identity: the kernel is constructed with an
+  actor carrying an `mcp:` prefix, so
+  `SELECT * FROM audit_log WHERE actor LIKE 'mcp:%'` reliably separates
+  MCP-initiated operations from scripts and the demo agent.
+- **Boundary validation.** Every argument is validated before any kernel call, so
+  a bad request never reaches the database and never buys an embedding. Unknown
+  keys are rejected rather than ignored — a typo'd `min_confidance` that was
+  silently dropped would return *more* memories than asked for while looking like
+  it worked.
+
+### Adding the server to your editor
+
+The server needs `CRDB_CONNECTION_STRING` in its environment. It will read the
+repo's `.env`, but only if the client happens to spawn it with the repo as the
+working directory — so **pass the connection string explicitly** in the client
+config, as below. Use absolute paths for the interpreter.
+
+**Claude Code** — `.mcp.json` at the project root (checked in, shared with the
+team):
+
+```json
+{
+  "mcpServers": {
+    "recall": {
+      "command": "/absolute/path/to/recall/.venv/bin/python",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "CRDB_CONNECTION_STRING": "postgresql://user:pass@cluster.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full&sslrootcert=/absolute/path/root.crt",
+        "AWS_REGION": "us-east-1",
+        "RECALL_MCP_ACTOR": "claude-code",
+        "RECALL_READ_ONLY": "false"
+      }
+    }
+  }
+}
+```
+
+Or from the CLI (note the `--` separating Claude's own flags from the command,
+and that `--env` must not sit directly before the server name):
+
+```bash
+claude mcp add --env RECALL_MCP_ACTOR=claude-code --transport stdio recall \
+  -- /absolute/path/to/recall/.venv/bin/python -m mcp_server
+```
+
+Verify with `/mcp` inside Claude Code; the eight tools appear as
+`mcp__recall__remember`, `mcp__recall__recall`, and so on.
+
+**Cursor** — `.cursor/mcp.json` in the project (or `~/.cursor/mcp.json` for all
+projects). Same shape as Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "recall": {
+      "command": "/absolute/path/to/recall/.venv/bin/python",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "CRDB_CONNECTION_STRING": "postgresql://user:pass@cluster.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full&sslrootcert=/absolute/path/root.crt",
+        "AWS_REGION": "us-east-1",
+        "RECALL_MCP_ACTOR": "cursor"
+      }
+    }
+  }
+}
+```
+
+**VS Code** — `.vscode/mcp.json`. Note the different top-level key (`servers`,
+not `mcpServers`) and the explicit `type`:
+
+```json
+{
+  "servers": {
+    "recall": {
+      "type": "stdio",
+      "command": "/absolute/path/to/recall/.venv/bin/python",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "CRDB_CONNECTION_STRING": "postgresql://user:pass@cluster.cockroachlabs.cloud:26257/defaultdb?sslmode=verify-full&sslrootcert=/absolute/path/root.crt",
+        "AWS_REGION": "us-east-1",
+        "RECALL_MCP_ACTOR": "vscode"
+      }
+    }
+  }
+}
+```
+
+To give an editor read-only access to shared memory — useful for a reviewer, or
+for any session you do not want writing to the team's `main` branch — set
+`"RECALL_READ_ONLY": "true"` in that client's `env` block.
+
+**Do not commit a config containing a real connection string.** Keep the
+populated file local, or reference a variable your shell already exports.
+
 ## Benchmark
 
 `benchmarks/bench_recall.py` loads 50k synthetic memories and reports recall
@@ -232,34 +401,43 @@ ruff check .    # lint
 pytest          # tests
 ```
 
-CI runs ruff + pytest on every push and pull request
-(see `.github/workflows/ci.yml`).
+CI runs ruff + pytest on every push and pull request against a **real
+CockroachDB** started by `scripts/dev_db.sh` — the same path you use locally, so
+a green CI run means the database-backed tests actually executed rather than
+skipped (see `.github/workflows/ci.yml`).
 
 ### Running the tests
 
-The kernel tests run against a **live CockroachDB instance** (v25.2+, for the
-`VECTOR` type). A local insecure single-node is fine:
+The kernel tests run against a **live CockroachDB instance** (for the `VECTOR`
+type). Start a local one and run them — no environment variable needed, the
+tests already default to it:
 
 ```bash
-docker run -d --name recall-crdb -p 26257:26257 \
-    cockroachdb/cockroach:latest-v25.2 start-single-node --insecure
-
-# point the tests at it (this is the default if unset)
-export RECALL_TEST_DSN="postgresql://root@localhost:26257/defaultdb?sslmode=disable"
-pytest
+./scripts/dev_db.sh up      # local single-node in Docker
+pytest                      # 119 passed, 2 skipped, ~3.5 min
 ```
 
 Each test creates its own fresh, migrated database and drops it on teardown, so
-runs are isolated. If no cluster is reachable at `RECALL_TEST_DSN`, the
-database-backed tests are skipped (with a message) rather than failing.
+runs are isolated.
+
+Point `RECALL_TEST_DSN` at the cloud cluster instead when you specifically want
+to prove something there — expect **hours**, not minutes, because each test
+rebuilds the vector index over the network (~92s per test vs ~2s locally).
+
+**A skip is not a pass.** When no cluster is reachable the database-backed tests
+*skip* rather than fail, so a misconfigured connection makes the suite exit 0
+having run almost nothing. Run `pytest -ra` and check the counts: anything other
+than 119 passed / 2 skipped means the tests are not reaching a cluster.
+
+Full details — local vs cloud, Bedrock integration tests, troubleshooting — are
+in **[DEV_SETUP.md](./DEV_SETUP.md)**.
 
 ## Status
 
-**Phase 4 — Replay & provenance.** Logical replay (any age) and physical
-`AS OF SYSTEM TIME` replay (GC-bounded, with a typed window guard),
-`explain_decision` with prominent invalidated-memory flags, and
-`rewind_and_rerun` against an injected agent. The MCP server arrives in Phase 5
-(see `CONTEXT.md` §8).
+**Phase 5 — MCP server.** The kernel is exposed over MCP as eight tools, usable
+from Claude Code, Cursor, and VS Code, with typed JSON results, read-only
+enforcement at the boundary, and `mcp:`-tagged audit identity. The demo agent and
+web UI arrive in Phase 6 (see `CONTEXT.md` §8).
 
 ## License
 

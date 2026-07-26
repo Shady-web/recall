@@ -21,7 +21,14 @@ what provenance and re-runs are built on.
 It uses ``SET TRANSACTION AS OF SYSTEM TIME``, so it sees the true historical
 bytes: rows as they were before any in-place edit, including changes that left
 no logical trace. This is the forensic path. It is bounded by MVCC garbage
-collection (``gc.ttlseconds``, 4h by default), so it only reaches back so far.
+collection: how far back it reaches is set by the cluster's ``gc.ttlseconds``,
+which :func:`replay_window_bounds` reads **live from the zone config on every
+call** rather than assuming a value. Clusters differ — a CockroachDB Cloud Basic
+cluster reports 4500s (75 min), the self-hosted default is 14400s (4h) — so
+never hard-code an expected window. If that live read fails, the code falls back
+to a deliberately conservative :data:`_DEFAULT_GC_TTL_SECONDS`, which
+under-promises the window: better to refuse a replay the cluster would have
+served than to promise one it will reject.
 
 **Where they differ.** Suppose a memory's ``content`` was corrected in place by
 an operator. Logical replay shows the corrected text (that is the row Recall
@@ -42,11 +49,12 @@ takes an injected callable. The kernel remains pure.
 
 from __future__ import annotations
 
+import logging
 import re
 import uuid
 from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import psycopg
 from psycopg.rows import dict_row
@@ -67,11 +75,19 @@ from kernel.models import (
     ReplayWindow,
     RerunContext,
     RerunResult,
+    RewindSummary,
 )
 
-# CockroachDB's default gc.ttlseconds, used only if the zone config cannot be
-# read (e.g. restricted role). Deliberately conservative.
-_DEFAULT_GC_TTL_SECONDS = 14400
+logger = logging.getLogger("recall.kernel.replay")
+
+# Fallback used ONLY when the live zone config cannot be read (e.g. a restricted
+# role). Deliberately far shorter than any real cluster's gc.ttlseconds so a
+# failed read under-promises the window instead of over-promising it: claiming a
+# window wider than reality would wave through timestamps the cluster then
+# refuses, which is the failure this guard exists to prevent. Observed real
+# values vary widely (a CockroachDB Cloud Basic cluster reports 4500s; the
+# self-hosted default is 14400s), so there is no safe "typical" value to assume.
+_DEFAULT_GC_TTL_SECONDS = 600
 
 _GC_TTL_RE = re.compile(r"gc\.ttlseconds\s*=\s*(\d+)")
 
@@ -93,13 +109,30 @@ def replay_window_bounds(db: Database) -> ReplayWindow:
             row = conn.execute(
                 "SHOW ZONE CONFIGURATION FOR TABLE memories"
             ).fetchone()
-            if row is not None:
-                match = _GC_TTL_RE.search(str(row[1]))
-                if match:
-                    ttl = int(match.group(1))
-        except Exception:
-            # Zone config unreadable — fall back to the documented default.
-            pass
+            match = _GC_TTL_RE.search(str(row[1])) if row is not None else None
+            if match:
+                ttl = int(match.group(1))
+            else:
+                # Read succeeded but yielded no gc.ttlseconds — same silent-narrowing
+                # risk as an outright failure, so it warns too.
+                logger.warning(
+                    "could not parse gc.ttlseconds from the zone configuration for "
+                    "table 'memories'; using the conservative fallback of %ds. "
+                    "Physical replay will refuse anything older than that, which may "
+                    "be far narrower than this cluster's real GC window.",
+                    _DEFAULT_GC_TTL_SECONDS,
+                )
+        except Exception as exc:
+            logger.warning(
+                "live read of gc.ttlseconds failed (%s: %s); using the conservative "
+                "fallback of %ds. Physical replay will refuse anything older than "
+                "that, so replay_cluster_at() may raise ReplayWindowExpiredError for "
+                "timestamps it previously served. Check that this role can run "
+                "SHOW ZONE CONFIGURATION.",
+                type(exc).__name__,
+                exc,
+                _DEFAULT_GC_TTL_SECONDS,
+            )
         now = conn.execute("SELECT now()").fetchone()[0]
         return ReplayWindow(
             gc_ttl_seconds=ttl,
@@ -421,33 +454,24 @@ def _ref(m: Memory) -> MemoryRef:
     )
 
 
-def rewind_and_rerun(
-    db: Database,
-    actor: str,
-    decision_id: str | uuid.UUID,
-    agent: Callable[[RerunContext], Any],
-    *,
-    as_of: datetime | None = None,
-) -> RerunResult:
-    """Reconstruct the branch as of a decision and re-run an agent against it.
+class _RewindState(NamedTuple):
+    """What both rewind paths need before they diverge."""
 
-    The branch state is rebuilt with **logical** replay, so this works
-    regardless of the decision's age. ``agent`` is injected and receives a
-    :class:`RerunContext`; the kernel knows nothing about how it reaches a
-    decision.
+    decision: dict[str, Any]
+    contributing: list[uuid.UUID]
+    then: list[Memory]
+    now: list[Memory]
+    window: ReplayWindow
+    diff: MemoryAvailabilityDiff
 
-    ``as_of`` selects which reconstructed state the agent runs against:
 
-    * **default (the decision's timestamp)** — faithful replay. A deterministic
-      agent reproduces the original action, which is the fidelity check; a
-      *changed* agent reveals how a new version would have handled a past
-      incident.
-    * **a later time (e.g. now)** — "given what we have learned since, would it
-      still decide this?". This is what flips the action when a supporting
-      memory has been retracted or superseded.
+def _rewind_state(db: Database, actor: str, decision_id: str | uuid.UUID) -> _RewindState:
+    """Reconstruct the shared rewind context: the decision, its provenance, and
+    the branch as it was at decision time vs now.
 
-    Either way the returned ``memory_diff`` always compares decision time
-    against now, so the caller can see exactly what changed.
+    Shared by :func:`rewind_summary` (which stops here) and
+    :func:`rewind_and_rerun` (which then runs an agent against it), so the two
+    can never drift on what "then" and "now" mean.
     """
     with db.transaction(read_only=True) as conn:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -476,13 +500,95 @@ def rewind_and_rerun(
         then_count=len(then),
         now_count=len(now_memories),
     )
+    return _RewindState(d, contributing, then, now_memories, now_window, diff)
+
+
+def rewind_summary(
+    db: Database,
+    actor: str,
+    decision_id: str | uuid.UUID,
+) -> RewindSummary:
+    """Rewind to a decision and report what changed — **without re-running any agent**.
+
+    This is :func:`rewind_and_rerun` minus the agent: the branch is rebuilt with
+    logical replay (so it works at any age) and the then-vs-now memory
+    availability diff is returned, but nothing is invoked and no new decision is
+    produced. Callers that must not trigger a model call as a side effect of a
+    read should use this.
+    """
+    state = _rewind_state(db, actor, decision_id)
+    d, diff = state.decision, state.diff
+
+    summary = RewindSummary(
+        decision_id=d["id"],
+        branch_id=d["branch_id"],
+        branch_name=d["branch_name"],
+        decision_at=d["created_at"],
+        replayed_at=d["created_at"],
+        action=d["action"],
+        rationale=d["rationale"],
+        memories_at_decision=[_ref(m) for m in state.then],
+        memory_diff=diff,
+        contributing_memory_ids=state.contributing,
+    )
+
+    def audit_work(conn: psycopg.Connection) -> None:
+        audit.record(
+            conn,
+            actor=actor,
+            op="rewind_summary",
+            target_type="decision",
+            target_id=d["id"],
+            payload={
+                "replayed_at": summary.replayed_at.isoformat(),
+                "memories_then": diff.then_count,
+                "memories_now": diff.now_count,
+                "only_then": len(diff.only_then),
+                "only_now": len(diff.only_now),
+            },
+        )
+
+    db.run_in_transaction(audit_work)
+    return summary
+
+
+def rewind_and_rerun(
+    db: Database,
+    actor: str,
+    decision_id: str | uuid.UUID,
+    agent: Callable[[RerunContext], Any],
+    *,
+    as_of: datetime | None = None,
+) -> RerunResult:
+    """Reconstruct the branch as of a decision and re-run an agent against it.
+
+    The branch state is rebuilt with **logical** replay, so this works
+    regardless of the decision's age. ``agent`` is injected and receives a
+    :class:`RerunContext`; the kernel knows nothing about how it reaches a
+    decision.
+
+    ``as_of`` selects which reconstructed state the agent runs against:
+
+    * **default (the decision's timestamp)** — faithful replay. A deterministic
+      agent reproduces the original action, which is the fidelity check; a
+      *changed* agent reveals how a new version would have handled a past
+      incident.
+    * **a later time (e.g. now)** — "given what we have learned since, would it
+      still decide this?". This is what flips the action when a supporting
+      memory has been retracted or superseded.
+
+    Either way the returned ``memory_diff`` always compares decision time
+    against now, so the caller can see exactly what changed.
+    """
+    state = _rewind_state(db, actor, decision_id)
+    d, now_window, diff = state.decision, state.window, state.diff
 
     decision = Decision.model_validate(d)
     evaluated_at = as_of if as_of is not None else d["created_at"]
     if as_of is None:
-        context_memories = then
+        context_memories = state.then
     elif as_of == now_window.latest:
-        context_memories = now_memories
+        context_memories = state.now
     else:
         context_memories = replay_branch_at(
             db, actor, d["branch_id"], as_of, audit_op="rewind_replay"
@@ -507,7 +613,7 @@ def rewind_and_rerun(
         new_rationale=new.rationale,
         action_changed=new.action != d["action"],
         memory_diff=diff,
-        contributing_memory_ids=contributing,
+        contributing_memory_ids=state.contributing,
     )
 
     def audit_work(conn: psycopg.Connection) -> None:

@@ -7,6 +7,13 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+
+    # NOTE: CockroachDB is started as a step below, not as a `services:` block.
+    # A service container cannot be given a command, and this image's entrypoint
+    # exits immediately without one ("error: mode unset, can be shell, bash, or
+    # cockroach command"). Starting it via scripts/dev_db.sh also means CI runs
+    # the exact same code path developers do, so the two cannot drift.
+
     steps:
       - uses: actions/checkout@v4
 
@@ -25,11 +32,42 @@ jobs:
         # and tests that touch the module have well-formed placeholder values.
         run: cp .env.example .env
 
+      - name: Start CockroachDB
+        # Pinned to the cloud cluster's major version inside the script, and it
+        # enables `feature.vector_index.enabled` (migration 002's vector index
+        # needs it, and the migration cannot set it itself).
+        run: ./scripts/dev_db.sh up
+
       - name: Ruff
         run: ruff check .
 
       - name: Pytest
-        run: pytest -q
+        env:
+          # Turn a missing cluster into a hard collection error instead of a
+          # silent skip. Without this a broken database connection would make the
+          # suite exit 0 having run almost nothing, and CI would go green on a
+          # suite that never executed. See tests/conftest.py.
+          RECALL_REQUIRE_CRDB: "1"
+        run: pytest -q -ra --junitxml=pytest-report.xml
+
+      - name: Assert the database-backed tests actually ran
+        # Belt and braces on top of RECALL_REQUIRE_CRDB: assert the observed
+        # counts, so CI fails loudly if the suite silently shrinks. The only
+        # legitimate skips are the two opt-in Bedrock integration tests, which
+        # need real AWS credentials and cost money.
+        if: always()
+        run: python scripts/check_ci_results.py pytest-report.xml --min-passed 119 --max-skipped 2
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: pytest-report.xml
 
       - name: Smoke-check config loads
         run: python -c "from kernel.config import settings; print(settings)"
+
+      - name: Stop CockroachDB
+        if: always()
+        run: ./scripts/dev_db.sh down

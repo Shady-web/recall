@@ -1,14 +1,14 @@
 """Pytest fixtures for tests that run against a live CockroachDB instance.
 
-Set ``RECALL_TEST_DSN`` to point at a running cluster; it defaults to a local
-insecure single-node instance:
-
-    docker run -d --name recall-crdb -p 26257:26257 \\
-        cockroachdb/cockroach:latest-v25.2 start-single-node --insecure
+The default target is a local insecure single-node instance, which
+``./scripts/dev_db.sh up`` starts for you — so the usual workflow needs no
+environment variable at all. Set ``RECALL_TEST_DSN`` to point somewhere else
+(e.g. the cloud cluster) when you specifically want to test against it; expect
+that to be roughly 40x slower per test. See DEV_SETUP.md.
 
 Each test that needs a database gets its own freshly-created, migrated database,
 which is dropped on teardown — so tests are isolated and never see each other's
-rows.
+rows. That isolation is why per-test database setup dominates the runtime.
 """
 
 from __future__ import annotations
@@ -41,23 +41,55 @@ def _admin_dsn() -> str:
     return _with_db(BASE_DSN, "defaultdb")
 
 
+# Generous on purpose. A local insecure node answers in milliseconds, but a
+# CockroachDB Cloud cluster over TLS from a laptop routinely takes 5-6s to
+# connect — and because an unreachable cluster *skips* the suite rather than
+# failing it, too tight a probe turns every database-backed test green without
+# running any of them. Waiting is the cheaper mistake.
+_PROBE_TIMEOUT_SECONDS = 15
+
+
 def _crdb_available() -> bool:
     try:
-        with psycopg.connect(_admin_dsn(), connect_timeout=3) as conn:
+        with psycopg.connect(
+            _admin_dsn(), connect_timeout=_PROBE_TIMEOUT_SECONDS
+        ) as conn:
             conn.execute("SELECT 1")
         return True
     except Exception:
         return False
 
 
-# Skip the whole suite (with a clear reason) if no cluster is reachable, rather
-# than erroring out — this keeps `pytest` runnable without a database present.
+# Probed once per session rather than per use — the cloud probe costs seconds.
+_CRDB_AVAILABLE = _crdb_available()
+
+# Host:port/db of the target, safe to print: everything before the last '@' (the
+# credentials) is dropped, so this never leaks a password into a skip message.
+_TARGET = BASE_DSN.split("@")[-1].split("?")[0]
+
+# Skip the database-backed tests (with a clear reason) when no cluster is
+# reachable, rather than erroring out — this keeps `pytest` runnable with no
+# database present.
+#
+# The cost of that convenience is that a misconfigured connection makes the suite
+# exit 0 having run almost nothing. Set RECALL_REQUIRE_CRDB=1 to buy it back: the
+# skip becomes a hard collection error. CI sets it, so a green CI run cannot mean
+# "skipped everything" — it can only mean the suite actually executed.
+_REQUIRE_CRDB = os.environ.get("RECALL_REQUIRE_CRDB") == "1"
+
+if _REQUIRE_CRDB and not _CRDB_AVAILABLE:
+    raise RuntimeError(
+        f"RECALL_REQUIRE_CRDB=1 but no CockroachDB is reachable at {_TARGET}. "
+        f"Refusing to run, because silently skipping the database-backed tests "
+        f"would report success for a suite that never ran. Start a cluster with "
+        f"`./scripts/dev_db.sh up`, or unset RECALL_REQUIRE_CRDB to allow skips."
+    )
+
 requires_crdb = pytest.mark.skipif(
-    not _crdb_available(),
+    not _CRDB_AVAILABLE,
     reason=(
-        "no CockroachDB reachable at RECALL_TEST_DSN; start one with "
-        "`docker run -p 26257:26257 cockroachdb/cockroach:latest-v25.2 "
-        "start-single-node --insecure`"
+        f"no CockroachDB reachable at {_TARGET} (RECALL_TEST_DSN); "
+        f"start a local one with `./scripts/dev_db.sh up`"
     ),
 )
 
@@ -69,8 +101,12 @@ def _enable_vector_index() -> None:
     This is a cluster-wide (not per-database) setting; enabling it once for the
     session is enough. A no-op if the cluster is unreachable — the DB-backed
     tests skip in that case anyway.
+
+    ``scripts/dev_db.sh up`` sets this too, so a developer or CI runner that
+    started the cluster that way is already covered; this keeps the suite
+    self-sufficient against a cluster started any other way.
     """
-    if not _crdb_available():
+    if not _CRDB_AVAILABLE:
         return
     with psycopg.connect(_admin_dsn(), autocommit=True) as conn:
         conn.execute("SET CLUSTER SETTING feature.vector_index.enabled = true")

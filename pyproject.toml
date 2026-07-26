@@ -18,6 +18,8 @@ dependencies = [
     "pydantic>=2.6,<3",
     "pydantic-settings>=2.2,<3",
     "python-dotenv>=1.0",
+    # Official Python MCP SDK — powers mcp_server/ (Phase 5).
+    "mcp>=1.28,<2",
 ]
 
 [project.optional-dependencies]
@@ -29,6 +31,10 @@ dev = [
 
 [tool.setuptools]
 packages = ["kernel", "mcp_server", "agent"]
+
+[project.scripts]
+# Entry point the MCP client configs in the README point at.
+recall-mcp = "mcp_server.server:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
