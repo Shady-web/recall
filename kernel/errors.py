@@ -27,3 +27,15 @@ class InvalidStateError(RecallError):
 
 class EmbeddingError(RecallError):
     """Raised when producing an embedding fails (e.g. Bedrock error/throttling)."""
+
+
+class ReplayWindowExpiredError(RecallError):
+    """Raised when a PHYSICAL replay reaches past CockroachDB's MVCC GC window.
+
+    Physical replay uses ``AS OF SYSTEM TIME``, which cannot read older than
+    ``gc.ttlseconds``. Rather than returning empty or misleading data (the raw
+    engine error is often something unhelpful like ``database ... does not
+    exist``), the kernel refuses up front and names the window it can serve.
+
+    Logical replay (:func:`kernel.replay.replay_branch_at`) has no such limit.
+    """
