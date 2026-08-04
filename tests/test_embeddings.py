@@ -6,7 +6,11 @@ import json
 import math
 
 import pytest
-from botocore.exceptions import ClientError
+from botocore.exceptions import (
+    ClientError,
+    NoCredentialsError,
+    PartialCredentialsError,
+)
 
 from kernel.embeddings import (
     BedrockEmbeddingProvider,
@@ -135,6 +139,47 @@ def test_bedrock_non_retryable_error_surfaces_clearly():
     with pytest.raises(EmbeddingError) as exc:
         provider.embed("x")
     assert "AccessDeniedException" in str(exc.value)
+
+
+def test_bedrock_missing_credentials_becomes_an_embedding_error():
+    """NoCredentialsError is a BotoCoreError, not a ClientError — it used to
+    escape the kernel's own error type entirely."""
+
+    class _Unauthenticated:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke_model(self, **_):
+            self.calls += 1
+            raise NoCredentialsError()
+
+    client = _Unauthenticated()
+    sleeps: list[float] = []
+    provider = BedrockEmbeddingProvider(
+        model_id="m", region="us-east-1", client=client, sleep=sleeps.append
+    )
+    with pytest.raises(EmbeddingError) as exc:
+        provider.embed("anything")
+
+    message = str(exc.value)
+    assert "authentication failed" in message
+    assert "AWS_BEARER_TOKEN_BEDROCK" in message  # names the fix
+    assert client.calls == 1  # not retried: waiting cannot conjure credentials
+    assert sleeps == []
+
+
+def test_bedrock_partial_credentials_becomes_an_embedding_error():
+    class _HalfConfigured:
+        def invoke_model(self, **_):
+            raise PartialCredentialsError(
+                provider="env", cred_var="AWS_SECRET_ACCESS_KEY"
+            )
+
+    provider = BedrockEmbeddingProvider(
+        model_id="m", region="us-east-1", client=_HalfConfigured()
+    )
+    with pytest.raises(EmbeddingError, match="authentication failed"):
+        provider.embed("anything")
 
 
 def test_bedrock_wrong_dimension_is_rejected():

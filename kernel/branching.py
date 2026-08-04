@@ -93,6 +93,7 @@ from kernel.models import (
     Branch,
     BranchDiff,
     BranchSideDiff,
+    BranchSummary,
     CommitResult,
     MemoryConflict,
 )
@@ -366,10 +367,15 @@ def commit(
             )
             replayed: list[uuid.UUID] = []
             for m in cur.fetchall():
+                # embedding_model rides along with the embedding it describes —
+                # a replayed row keeps the provenance of the vector it carries,
+                # not the provenance of whoever ran the commit.
                 cur.execute(
                     "INSERT INTO memories (branch_id, kind, content, embedding, source, "
-                    "                      confidence, metadata, origin_memory_id) "
-                    "SELECT %s, kind, content, embedding, source, confidence, metadata, id "
+                    "                      confidence, metadata, origin_memory_id, "
+                    "                      embedding_model) "
+                    "SELECT %s, kind, content, embedding, source, confidence, metadata, "
+                    "       id, embedding_model "
                     "FROM memories WHERE id = %s RETURNING id",
                     (parent_id, m["id"]),
                 )
@@ -484,6 +490,37 @@ def diff(
             return BranchDiff(a=side_a, b=side_b)
 
     return db.run_in_transaction(work)
+
+
+def list_branches(db: Database) -> list[BranchSummary]:
+    """Return every branch with its owned-row counts, oldest first.
+
+    One aggregate query rather than a per-branch fan-out — the branch tree
+    needs all of them at once. Read-only and unaudited by design: this is
+    structural metadata (what branches exist), not a read of remembered
+    content, and auditing every UI poll of the tree would bury the audit log in
+    noise that says nothing about who saw which memory.
+    """
+
+    def work(conn: psycopg.Connection) -> list[BranchSummary]:
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT b.id, b.name, b.parent_branch_id, b.fork_point_ts, b.status,
+                       b.created_by, b.created_at,
+                       (SELECT count(*) FROM memories m WHERE m.branch_id = b.id)
+                           AS memory_count,
+                       (SELECT count(*) FROM decisions d WHERE d.branch_id = b.id)
+                           AS decision_count,
+                       (SELECT count(*) FROM branches c WHERE c.parent_branch_id = b.id)
+                           AS child_count
+                  FROM branches b
+                 ORDER BY b.created_at
+                """
+            )
+            return [BranchSummary.model_validate(r) for r in cur.fetchall()]
+
+    return db.run_in_transaction(work, read_only=True)
 
 
 def get_branch(db: Database, branch: str | uuid.UUID) -> Branch:

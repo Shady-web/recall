@@ -29,6 +29,15 @@ class EmbeddingError(RecallError):
     """Raised when producing an embedding fails (e.g. Bedrock error/throttling)."""
 
 
+class SchemaMismatchError(RecallError):
+    """Raised when the running code and the database schema disagree.
+
+    Currently one case: the embedding provider's vector width differs from the
+    ``VECTOR(n)`` column it would be written to. Caught at startup, because the
+    alternative is a confusing per-insert database error much later.
+    """
+
+
 class ReplayWindowExpiredError(RecallError):
     """Raised when a PHYSICAL replay reaches past CockroachDB's MVCC GC window.
 

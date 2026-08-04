@@ -29,7 +29,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from kernel import audit
-from kernel.db import Database, get_default_database
+from kernel.db import (
+    Database,
+    get_default_database,
+    verify_embedding_dimension,
+    verify_embedding_provider,
+)
 from kernel.embeddings import EmbeddingProvider, vector_literal
 from kernel.errors import EmbeddingError, InvalidStateError, NotFoundError, ReadOnlyError
 from kernel.models import Decision, Memory, RecallResult
@@ -97,21 +102,32 @@ class MemoryKernel:
         cls,
         db: Database | None = None,
         embedder: EmbeddingProvider | None = None,
+        *,
+        verify_dimensions: bool = True,
     ) -> MemoryKernel:
         """Build a kernel using the process configuration.
 
         Defaults to a real Bedrock embedding provider (constructed lazily, so no
         AWS call happens until the first embed).
+
+        ``verify_dimensions`` checks the provider's vector width against the
+        schema's ``VECTOR(n)`` column — one cheap read against metadata that
+        turns a mismatch into a clear startup failure instead of a database
+        error on first write. It reads no AWS credentials and calls no model.
         """
         from kernel.config import settings
         from kernel.embeddings import BedrockEmbeddingProvider
 
-        return cls(
+        kernel = cls(
             db or get_default_database(),
             actor=settings.recall_actor_id,
             read_only=settings.recall_read_only,
             embedder=embedder or BedrockEmbeddingProvider(),
         )
+        if verify_dimensions:
+            verify_embedding_dimension(kernel.db, kernel.embedder)
+            verify_embedding_provider(kernel.db, kernel.embedder)
+        return kernel
 
     # -- internal helpers -------------------------------------------------
 
@@ -123,6 +139,10 @@ class MemoryKernel:
 
     def _resolve_branch(self, cur: psycopg.Cursor, branch: str | uuid.UUID) -> dict[str, Any]:
         return resolve_branch(cur, branch)
+
+    def _space_id(self) -> str | None:
+        """Identity of the embedding space this kernel writes into."""
+        return getattr(self.embedder, "space_id", None)
 
     def _embed(self, text: str) -> str:
         """Embed ``text`` and return a CockroachDB VECTOR literal.
@@ -163,8 +183,9 @@ class MemoryKernel:
                 b = self._resolve_branch(cur, branch)
                 cur.execute(
                     f"INSERT INTO memories "
-                    f"  (branch_id, kind, content, embedding, source, confidence, metadata) "
-                    f"VALUES (%s, %s, %s, %s::VECTOR, %s, %s, %s) "
+                    f"  (branch_id, kind, content, embedding, source, confidence, "
+                    f"   metadata, embedding_model) "
+                    f"VALUES (%s, %s, %s, %s::VECTOR, %s, %s, %s, %s) "
                     f"RETURNING {_MEMORY_COLS}",
                     (
                         b["id"],
@@ -174,6 +195,7 @@ class MemoryKernel:
                         source,
                         confidence,
                         Jsonb(metadata or {}),
+                        self._space_id(),
                     ),
                 )
                 row = cur.fetchone()
@@ -253,8 +275,9 @@ class MemoryKernel:
 
                 cur.execute(
                     f"INSERT INTO memories "
-                    f"  (branch_id, kind, content, embedding, source, confidence, metadata) "
-                    f"VALUES (%s, %s, %s, %s::VECTOR, %s, %s, %s) "
+                    f"  (branch_id, kind, content, embedding, source, confidence, "
+                    f"   metadata, embedding_model) "
+                    f"VALUES (%s, %s, %s, %s::VECTOR, %s, %s, %s, %s) "
                     f"RETURNING {_MEMORY_COLS}",
                     (
                         acting_branch_id,
@@ -264,6 +287,7 @@ class MemoryKernel:
                         source if source is not None else old["source"],
                         confidence if confidence is not None else old["confidence"],
                         Jsonb(metadata if metadata is not None else old["metadata"]),
+                        self._space_id(),
                     ),
                 )
                 new_row = cur.fetchone()
@@ -390,6 +414,12 @@ class MemoryKernel:
 
         return resolve_ancestry(self.db, branch)
 
+    def list_branches(self) -> Any:
+        """Every branch with its owned-row counts (see :func:`kernel.branching.list_branches`)."""
+        from kernel.branching import list_branches as _list_branches
+
+        return _list_branches(self.db)
+
     def record_decision(
         self,
         branch: str | uuid.UUID,
@@ -514,6 +544,36 @@ class MemoryKernel:
                 return [Memory.model_validate(r) for r in rows]
 
         return self.db.run_in_transaction(work)
+
+    def list_decisions(
+        self,
+        branch: str | uuid.UUID | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[Decision]:
+        """List recorded decisions newest-first, optionally scoped to a branch.
+
+        Added in Phase 6 so the decision inspector can offer a picker without
+        anything outside the kernel writing SQL. Like :meth:`list_branches`
+        this is structural (which decisions exist) rather than a read of
+        remembered content, so it is not audited — asking a decision *why* it
+        was made is :func:`kernel.replay.explain_decision`, and that is.
+        """
+
+        def work(conn: psycopg.Connection) -> list[Decision]:
+            with conn.cursor(row_factory=dict_row) as cur:
+                query = f"SELECT {_DECISION_COLS} FROM decisions"
+                params: list[Any] = []
+                if branch is not None:
+                    b = self._resolve_branch(cur, branch)
+                    query += " WHERE branch_id = %s"
+                    params.append(b["id"])
+                query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+                params.extend([limit, offset])
+                cur.execute(query, params)
+                return [Decision.model_validate(r) for r in cur.fetchall()]
+
+        return self.db.run_in_transaction(work, read_only=True)
 
     def recall(
         self,

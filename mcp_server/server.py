@@ -59,7 +59,12 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from kernel import replay as replay_mod
-from kernel.db import Database, get_default_database
+from kernel.db import (
+    Database,
+    get_default_database,
+    verify_embedding_dimension,
+    verify_embedding_provider,
+)
 from kernel.embeddings import EmbeddingProvider
 from kernel.memory import MemoryKernel
 from mcp_server.config import McpSettings, load_mcp_settings
@@ -448,10 +453,16 @@ def create_server(
         read_only=settings.read_only,
         embedder=embedder or BedrockEmbeddingProvider(),
     )
+    # Before serving, not on first write: an MCP client would otherwise see the
+    # mismatch as a failed remember() tool call rather than a server that
+    # refused to start.
+    schema_dim = verify_embedding_dimension(kernel.db, kernel.embedder)
+    verify_embedding_provider(kernel.db, kernel.embedder)
     logger.info(
-        "Recall MCP server ready (actor=%s, read_only=%s)",
+        "Recall MCP server ready (actor=%s, read_only=%s, embedding_dim=%s)",
         settings.actor,
         settings.read_only,
+        schema_dim,
     )
     return build_server(kernel, settings)
 
