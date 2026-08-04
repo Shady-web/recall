@@ -56,7 +56,10 @@ jobs:
         # legitimate skips are the two opt-in Bedrock integration tests, which
         # need real AWS credentials and cost money.
         if: always()
-        run: python scripts/check_ci_results.py pytest-report.xml --min-passed 119 --max-skipped 2
+        # Raised from 131 in Phase 6 (+25 for the demo agent and the kernel
+        # read paths the console needs). Bump this whenever the suite grows —
+        # a floor left behind is a floor that stops catching a shrinking suite.
+        run: python scripts/check_ci_results.py pytest-report.xml --min-passed 156 --max-skipped 2
 
       - name: Upload test report
         if: always()

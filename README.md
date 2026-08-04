@@ -468,7 +468,7 @@ tests already default to it:
 
 ```bash
 ./scripts/dev_db.sh up      # local single-node in Docker
-pytest                      # 119 passed, 2 skipped, ~3.5 min
+pytest                      # 131 passed, 2 skipped, ~4.5 min
 ```
 
 Each test creates its own fresh, migrated database and drops it on teardown, so
@@ -481,7 +481,7 @@ rebuilds the vector index over the network (~92s per test vs ~2s locally).
 **A skip is not a pass.** When no cluster is reachable the database-backed tests
 *skip* rather than fail, so a misconfigured connection makes the suite exit 0
 having run almost nothing. Run `pytest -ra` and check the counts: anything other
-than 119 passed / 2 skipped means the tests are not reaching a cluster.
+than 131 passed / 2 skipped means the tests are not reaching a cluster.
 
 Full details — local vs cloud, Bedrock integration tests, troubleshooting — are
 in **[DEV_SETUP.md](./DEV_SETUP.md)**.

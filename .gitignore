@@ -27,7 +27,11 @@ htmlcov/
 node_modules/
 ui/dist/
 ui/build/
+ui/tsconfig.tsbuildinfo
 *.local
+
+# Demo runtime (scripts/run_demo.sh writes backend/frontend logs here)
+.demo-logs/
 
 # Terraform
 .terraform/

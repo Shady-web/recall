@@ -13,7 +13,7 @@ while CI reported success.
 
 Usage:
     python scripts/check_ci_results.py pytest-report.xml \\
-        --min-passed 119 --max-skipped 2
+        --min-passed 131 --max-skipped 2
 """
 
 from __future__ import annotations
