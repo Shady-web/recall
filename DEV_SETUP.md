@@ -6,7 +6,7 @@ Recall talks to CockroachDB and nothing else, so the only real setup decision is
 | | Local (Docker) | CockroachDB Cloud |
 |---|---|---|
 | **Use it for** | the test suite, day-to-day development | integration checks, benchmarks, the demo |
-| **Full suite** | **~3.5 minutes** | ~3 hours |
+| **Full suite** | **~4.5 minutes** | ~3 hours |
 | **Needs the network** | no | yes |
 | **Setup** | `./scripts/dev_db.sh up` | `.env` + certificate |
 | **Data** | throwaway, wiped on `down` | the real system of record |
@@ -32,7 +32,7 @@ Requires Docker. Nothing else — no `ccloud`, no certificates, no secrets.
 
 ```bash
 ./scripts/dev_db.sh up      # start and wait until it accepts SQL
-pytest                      # 119 passed, 2 skipped, ~3.5 min
+pytest                      # 131 passed, 2 skipped, ~4.5 min
 ```
 
 That is the whole loop. The tests default to
@@ -67,7 +67,7 @@ building the vector index in migration `002`.
 | `DROP DATABASE` | 0.25s | 4.6s |
 | **per test** | **~2.1s** | **~92s** |
 
-Across 121 tests that is 3.5 minutes versus over 3 hours. The isolation design
+Across 133 tests that is 4.5 minutes versus over 3 hours. The isolation design
 is right; running it over a network round-trip to another continent is what
 makes it expensive.
 
@@ -147,8 +147,39 @@ RECALL_RUN_BEDROCK_INTEGRATION=1 pytest tests/test_integration_bedrock.py
 
 Everything else uses `FakeEmbeddingProvider`, a deterministic offline provider,
 so the suite needs no AWS access at all. A clean run reports
-**119 passed, 2 skipped** — those two skips are these tests, and they are the
+**131 passed, 2 skipped** — those two skips are these tests, and they are the
 only legitimate skips in the suite.
+
+### Authenticating to Bedrock
+
+Either style works, and the kernel passes no credentials in code either way:
+
+| Style | What to set | How boto3 finds it |
+| --- | --- | --- |
+| **Bedrock API key** (bearer token) | `AWS_BEARER_TOKEN_BEDROCK` in `.env` or the shell | botocore prefers bearer auth for the `bedrock` signing name whenever the variable is set |
+| **SigV4 credentials** | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, an `aws configure` profile, or an instance role | the standard credential chain |
+
+Bearer-token auth needs **botocore ≥ 1.39**, so `pyproject.toml` pins
+`boto3>=1.39`; older versions ignore the variable and fail with a
+no-credentials error.
+
+One wrinkle is worth knowing, because the failure is silent. `pydantic-settings`
+reads `.env` into the `Settings` object — it does **not** put those values into
+`os.environ`, which is the only place botocore looks for the token. A token
+sitting in `.env` was therefore invisible to boto3. `Settings.export_bedrock_auth()`
+bridges the two, and `BedrockEmbeddingProvider` calls it just before building the
+client. A token already exported in your shell takes precedence, so the shell
+remains the override.
+
+To check which style is active without printing the secret:
+
+```bash
+python -c "from kernel.config import settings; print(settings)"
+```
+
+The summary reports `bedrock_auth='bearer-token'` or
+`bedrock_auth='aws-credential-chain'`; the token itself is a pydantic
+`SecretStr` and never renders.
 
 ## 5. Recall MCP server
 
@@ -166,7 +197,7 @@ Editor configuration for Claude Code, Cursor, and VS Code is in the
 
 ```bash
 ruff check .
-pytest                      # against local; ~3.5 min
+pytest                      # against local; ~4.5 min
 ```
 
 CI runs both on every push and pull request, **against a real CockroachDB**. The
@@ -210,7 +241,7 @@ exit code:
 pytest -ra                  # -ra reports every skip with its reason
 ```
 
-Expect **119 passed, 2 skipped**. Anything else — especially a large skip count —
+Expect **131 passed, 2 skipped**. Anything else — especially a large skip count —
 means the tests are not reaching a cluster.
 
 ### Why CockroachDB is a step, not a `services:` container

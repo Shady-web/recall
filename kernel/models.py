@@ -31,6 +31,21 @@ class Branch(_Row):
     created_at: datetime
 
 
+class BranchSummary(Branch):
+    """A branch plus the counts a tree view needs, resolved in one query.
+
+    Added in Phase 6: the UI draws a branch tree and needs per-branch totals.
+    Deriving them by listing every branch's memories would be one query per
+    branch, so the counts are aggregated alongside the branch rows instead.
+    Counts are of rows *owned by* the branch — they deliberately exclude
+    inherited memories, because the tree shows what each branch contributed.
+    """
+
+    memory_count: int = 0
+    decision_count: int = 0
+    child_count: int = 0
+
+
 class Memory(_Row):
     id: uuid.UUID
     branch_id: uuid.UUID

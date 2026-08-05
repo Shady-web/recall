@@ -51,12 +51,43 @@ _RETRYABLE_CODES = frozenset(
 )
 
 
+def _export_bedrock_auth() -> None:
+    """Make a ``.env``-supplied Bedrock bearer token visible to botocore.
+
+    Called just before the client is built, not at import, so that constructing
+    a provider with an injected client (the whole test suite) never needs a
+    loadable configuration. A configuration that will not load is not fatal
+    here: boto3 still has its own credential chain to fall back on, and letting
+    it try produces a better error than a config traceback would.
+    """
+    try:
+        from kernel.config import settings
+    except Exception:  # pragma: no cover - depends on ambient configuration
+        logger.debug("no loadable Settings; leaving Bedrock auth to boto3")
+        return
+    if not settings.export_bedrock_auth():
+        logger.debug("no Bedrock bearer token configured; boto3 will use SigV4")
+
+
 @runtime_checkable
 class EmbeddingProvider(Protocol):
     """Anything that can turn text into fixed-length unit vectors."""
 
     @property
     def dimensions(self) -> int: ...
+
+    @property
+    def space_id(self) -> str:
+        """Identity of the vector SPACE this provider produces.
+
+        Stored on every memory (``memories.embedding_model``) so a later read can
+        prove it is comparing like with like. Two providers may agree on
+        dimension and still be mutually meaningless — Titan and the fake provider
+        both emit 1024-dim unit vectors — so width is not identity. Any change
+        that moves the geometry (a different model, or a different output
+        dimension of the same model) must produce a different ``space_id``.
+        """
+        ...
 
     def embed(self, text: str) -> list[float]: ...
 
@@ -69,6 +100,11 @@ class BedrockEmbeddingProvider:
     The boto3 client is created lazily so importing this module (and running the
     fake-provider test suite) never requires AWS credentials. A client may be
     injected for testing.
+
+    Auth is whatever boto3 resolves. Setting ``AWS_BEARER_TOKEN_BEDROCK`` (a
+    Bedrock API key) selects bearer auth over SigV4 automatically, because
+    ``bedrock`` is a bearer-capable signing name and this client passes no
+    in-code credentials; see :func:`_export_bedrock_auth` for the ``.env`` path.
     """
 
     def __init__(
@@ -103,10 +139,17 @@ class BedrockEmbeddingProvider:
     def dimensions(self) -> int:
         return self._dimensions
 
+    @property
+    def space_id(self) -> str:
+        # Dimension is part of the identity: Titan V2 at 512 dimensions is a
+        # different space from Titan V2 at 1024, not a truncation of it.
+        return f"bedrock:{self.model_id}:{self._dimensions}"
+
     def _get_client(self):
         if self._client is None:
             import boto3
 
+            _export_bedrock_auth()
             self._client = boto3.client("bedrock-runtime", region_name=self.region)
         return self._client
 
@@ -148,7 +191,22 @@ class BedrockEmbeddingProvider:
         return embedding
 
     def _invoke_with_retry(self, body: str):
-        from botocore.exceptions import ClientError
+        from botocore.exceptions import (
+            ClientError,
+            NoCredentialsError,
+            PartialCredentialsError,
+            TokenRetrievalError,
+        )
+
+        # Auth never resolved, so no request was signed. Not retryable: waiting
+        # will not conjure credentials. These are BotoCoreError subclasses, not
+        # ClientError, so without this they escaped the kernel's error type
+        # entirely and surfaced as a bare 'Unable to locate credentials'.
+        auth_errors = (
+            NoCredentialsError,
+            PartialCredentialsError,
+            TokenRetrievalError,
+        )
 
         attempt = 0
         while True:
@@ -160,6 +218,14 @@ class BedrockEmbeddingProvider:
                     accept="application/json",
                     contentType="application/json",
                 )
+            except auth_errors as exc:
+                raise EmbeddingError(
+                    f"Bedrock authentication failed ({type(exc).__name__}): {exc}. "
+                    f"Set AWS_BEARER_TOKEN_BEDROCK to a Bedrock API key, or "
+                    f"provide SigV4 credentials (AWS_ACCESS_KEY_ID / "
+                    f"AWS_SECRET_ACCESS_KEY, an aws-configure profile, or an "
+                    f"instance role). See DEV_SETUP.md section 4."
+                ) from exc
             except ClientError as exc:
                 code = exc.response.get("Error", {}).get("Code", "")
                 message = exc.response.get("Error", {}).get("Message", str(exc))
@@ -200,6 +266,12 @@ class FakeEmbeddingProvider:
     @property
     def dimensions(self) -> int:
         return self._dimensions
+
+    @property
+    def space_id(self) -> str:
+        # Deliberately unmistakable. A database carrying these vectors must be
+        # obviously non-production when anyone inspects it.
+        return f"fake:hashing-trick:{self._dimensions}"
 
     def embed(self, text: str) -> list[float]:
         vec = [0.0] * self._dimensions

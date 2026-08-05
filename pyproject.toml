@@ -12,7 +12,9 @@ requires-python = ">=3.12"
 authors = [{ name = "Recall" }]
 dependencies = [
     "psycopg[binary,pool]>=3.1,<4",
-    "boto3>=1.34",
+    # >=1.39 for Bedrock bearer-token auth (AWS_BEARER_TOKEN_BEDROCK); earlier
+    # versions ignore the variable and fall through to SigV4.
+    "boto3>=1.39",
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "pydantic>=2.6,<3",
@@ -30,7 +32,7 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["kernel", "mcp_server", "agent"]
+packages = ["kernel", "mcp_server", "agent", "api"]
 
 [project.scripts]
 # Entry point the MCP client configs in the README point at.
@@ -46,3 +48,10 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# B008 forbids function calls in argument defaults. FastAPI's dependency system
+# is built on exactly that — `Query(...)` / `Body(...)` in a default IS the
+# declaration, and it is how the framework derives validation and the OpenAPI
+# schema. The rule is a true positive for ordinary code and a false one here.
+"api/main.py" = ["B008"]

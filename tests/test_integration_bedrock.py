@@ -8,8 +8,10 @@ when explicitly enabled:
     AWS_REGION=us-east-1 \\
     pytest tests/test_integration_bedrock.py -v
 
-Credentials are resolved by boto3 as usual (env vars, shared config, or an
-instance/role profile).
+Auth is resolved by boto3 as usual. Either style works: a Bedrock API key in
+``AWS_BEARER_TOKEN_BEDROCK`` (read from ``.env`` too — see
+``Settings.export_bedrock_auth``), or SigV4 credentials from env vars, shared
+config, or an instance/role profile.
 """
 
 from __future__ import annotations

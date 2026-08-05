@@ -8,8 +8,15 @@ placeholder values.
 
 from __future__ import annotations
 
-from pydantic import Field
+import os
+
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The environment variable botocore reads for Bedrock bearer-token auth. The
+# name is derived from the service's signing name ('bedrock'), not the client
+# name ('bedrock-runtime') — see botocore.utils._get_bearer_env_var_name.
+BEDROCK_BEARER_TOKEN_ENV = "AWS_BEARER_TOKEN_BEDROCK"
 
 
 class Settings(BaseSettings):
@@ -50,6 +57,14 @@ class Settings(BaseSettings):
         alias="BEDROCK_REASONING_MODEL",
         description="Bedrock model id used for agent reasoning.",
     )
+    aws_bearer_token_bedrock: SecretStr | None = Field(
+        None,
+        alias=BEDROCK_BEARER_TOKEN_ENV,
+        description=(
+            "Bedrock API key (bearer token). Optional: when unset, boto3 falls "
+            "back to its normal SigV4 credential chain."
+        ),
+    )
 
     # --- Recall runtime ---------------------------------------------------
     recall_actor_id: str = Field(
@@ -63,6 +78,28 @@ class Settings(BaseSettings):
         description="When true, the kernel refuses all writes and permits only reads.",
     )
 
+    def export_bedrock_auth(self) -> bool:
+        """Publish the Bedrock bearer token to ``os.environ`` for botocore.
+
+        botocore resolves the token from the *process environment* — the
+        ``ScopedEnvTokenProvider`` in ``botocore.tokens`` reads
+        ``AWS_BEARER_TOKEN_BEDROCK`` at signing time — but pydantic-settings
+        reads ``.env`` into this object only, never into ``os.environ``. Without
+        this bridge a token that lives in ``.env`` is invisible to boto3, and
+        the client falls through to the SigV4 chain and fails to authenticate.
+
+        A token already exported in the real environment always wins, so the
+        shell stays the override. Returns whether botocore will now find one.
+        """
+        if os.environ.get(BEDROCK_BEARER_TOKEN_ENV):
+            return True
+        if self.aws_bearer_token_bedrock is None:
+            return False
+        os.environ[BEDROCK_BEARER_TOKEN_ENV] = (
+            self.aws_bearer_token_bedrock.get_secret_value()
+        )
+        return True
+
     def __str__(self) -> str:  # pragma: no cover - trivial formatting
         """Human-readable summary that never reveals the connection secret."""
         return (
@@ -71,10 +108,17 @@ class Settings(BaseSettings):
             f"aws_region={self.aws_region!r}, "
             f"embedding_model={self.bedrock_embedding_model!r}, "
             f"reasoning_model={self.bedrock_reasoning_model!r}, "
+            f"bedrock_auth={self._bedrock_auth_style()!r}, "
             f"actor_id={self.recall_actor_id!r}, "
             f"read_only={self.recall_read_only}"
             ")"
         )
+
+    def _bedrock_auth_style(self) -> str:
+        """Name the auth style without revealing the token itself."""
+        if self.aws_bearer_token_bedrock is not None:
+            return "bearer-token"
+        return "aws-credential-chain"
 
     def _redacted_dsn(self) -> str:
         """Return the connection string with any password component masked."""

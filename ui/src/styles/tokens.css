@@ -1,0 +1,286 @@
+/* ==========================================================================
+   RECALL — "Cold Forensics"
+   The design system for the agent-memory console.
+   ==========================================================================
+
+   REFERENCE, AND WHERE WE DIVERGE
+
+   The taste anchor is Factory ("terminal war room at midnight") from the Refero
+   style catalogue: a dark instrument surface, monospace as the system voice,
+   hairline borders, no shadows, and colour reserved for live data rather than
+   decoration. That direction is right for a forensic console. This is not that
+   system — it is a system built on the same convictions, for a different job.
+
+   What we keep as conviction:
+     - one dark canvas everywhere; depth comes from contrast, not blur
+     - mono is the instrument voice; sans is the content voice
+     - flat surfaces, 1px hairlines, zero drop shadows
+     - colour is data, never chrome
+
+   What we deliberately change:
+
+   1. TEMPERATURE. Factory is warm — near-black #101010 with warm greys and a
+      signal-orange accent. Recall is cold: a blue-black canvas (#07090d) and a
+      slate ramp. This is a forensic tool for reading history, not a war room;
+      it should feel like glass and evidence, not like heat.
+
+   2. THE SIGNATURE MOVE. Factory's is a bright #eeeeee card landing on black.
+      Copying that would be borrowing its identity. Recall's signature is the
+      PROVENANCE RAIL: a 2px bar down the left edge of every memory and decision
+      row whose colour encodes that row's lifecycle. Recall's whole subject is
+      what a fact's status was then versus now, so the system's most repeated
+      visual element is the one that answers exactly that, at a glance, in every
+      list, without reading a word.
+
+   3. TRACKING. Factory presses everything tight with negative letter-spacing,
+      including its mono labels. Recall's mono labels open up (+0.09em): these
+      are instrument legends stamped on a panel, and they should read as
+      separate from content rather than as compressed display type.
+
+   4. DENSITY. Factory is comfortable — an 8px base and 96px section gaps, built
+      for a marketing page. Recall is an application showing hundreds of rows: a
+      4px base, 16–24px gaps, and sharper radii (2/6/12 against Factory's
+      3/10/20).
+
+   5. PALETTE SIZE. Factory permits two functional accents and calls anything
+      more noise. Recall needs four, because it renders a four-way distinction
+      that is the product: live/now, branch lineage, withdrawn evidence, and
+      knowledge acquired since. Each accent carries exactly one meaning and is
+      never used for chrome — the discipline is kept even though the count is
+      raised.
+   ========================================================================== */
+
+@import "tailwindcss";
+
+@theme {
+  /* --- Surfaces: a cold ramp from the void upward ---------------------- */
+  --color-void:        #07090d; /* page canvas — everything is measured off this */
+  --color-substrate:   #0c1017; /* panels, the primary raised plane */
+  --color-strata:      #121926; /* row hover, nested wells, selected states */
+  --color-seam:        #1c2635; /* hairline borders, dividers */
+  --color-seam-lit:    #2b3a4f; /* active/focused border, stronger rules */
+
+  /* --- Text ramp -------------------------------------------------------- */
+  --color-graphite:    #4d5b6e; /* disabled glyphs, decorative rules — never body */
+  --color-vapor:       #7d8b9e; /* secondary text, metadata, inactive labels */
+  --color-quartz:      #b8c4d2; /* body text */
+  --color-signal:      #e8eef6; /* headings, values, highest emphasis */
+
+  /* --- Functional accents. Each means one thing. ------------------------ */
+  --color-live:        #35d6c5; /* live / now / read-from-cluster */
+  --color-fork:        #7c8cf8; /* branch lineage, forks */
+  --color-retract:     #ff5d68; /* retracted, superseded, invalidated */
+  --color-learned:     #f0b45e; /* learned since — knowledge the past lacked */
+
+  /* Low-alpha washes for fills behind accented rows. */
+  --color-live-wash:    #35d6c51a;
+  --color-fork-wash:    #7c8cf81a;
+  --color-retract-wash: #ff5d681a;
+  --color-learned-wash: #f0b45e1a;
+
+  /* --- Type ------------------------------------------------------------- */
+  --font-sans: "InterVariable", "Inter", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+    Consolas, monospace;
+
+  /* --- Shape: sharper than the reference. The system is an instrument. --- */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 12px;
+
+  /* --- Motion: mechanical, like a CLI. Never springy. -------------------- */
+  --ease-instrument: cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ==========================================================================
+   Base
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+  background-color: var(--color-void);
+  color: var(--color-quartz);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-void);
+  /* A barely-there cold grid. Reads as instrument glass, not as decoration:
+     at 1.5% alpha it is felt more than seen. */
+  background-image:
+    linear-gradient(to right, #ffffff05 1px, transparent 1px),
+    linear-gradient(to bottom, #ffffff05 1px, transparent 1px);
+  background-size: 64px 64px;
+}
+
+::selection {
+  background: var(--color-fork);
+  color: var(--color-void);
+}
+
+/* Thin, self-effacing scrollbars — chrome should not compete with data. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-seam-lit) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--color-seam-lit);
+  border-radius: var(--radius-xs);
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--color-graphite); }
+
+/* ==========================================================================
+   The instrument voice — mono, uppercase, OPEN tracking (see divergence 3)
+   ========================================================================== */
+
+.legend {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--color-vapor);
+}
+
+.legend-dim { color: var(--color-graphite); }
+
+/* Numbers, timestamps, ids: always mono, always tabular so columns align. */
+.numeric {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+/* ==========================================================================
+   The provenance rail — Recall's signature element (see divergence 2)
+   ========================================================================== */
+
+.rail {
+  position: relative;
+  padding-left: 14px;
+}
+
+.rail::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 2px;
+  bottom: 2px;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--color-seam-lit);
+  transition: background 160ms var(--ease-instrument);
+}
+
+.rail-active::before   { background: var(--color-live); }
+.rail-fork::before     { background: var(--color-fork); }
+.rail-retract::before  { background: var(--color-retract); }
+.rail-learned::before  { background: var(--color-learned); }
+.rail-absent::before   { background: var(--color-graphite); }
+
+/* A withdrawn fact is struck through and dimmed: still on the record, no
+   longer load-bearing. Never hidden — this system does not delete. */
+.withdrawn {
+  opacity: 0.5;
+}
+.withdrawn .withdrawn-text {
+  text-decoration: line-through;
+  text-decoration-color: var(--color-retract);
+  text-decoration-thickness: 1px;
+}
+
+/* ==========================================================================
+   Focus — a cold ring, never a browser default
+   ========================================================================== */
+
+:focus-visible {
+  outline: 1px solid var(--color-live);
+  outline-offset: 1px;
+}
+
+/* ==========================================================================
+   The scrubber. Restyled from scratch: a machined track, not a form control.
+   ========================================================================== */
+
+.scrub {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 28px;
+  background: transparent;
+  cursor: ew-resize;
+}
+
+.scrub::-webkit-slider-runnable-track {
+  height: 2px;
+  background: var(--color-seam-lit);
+  border-radius: 1px;
+}
+.scrub::-moz-range-track {
+  height: 2px;
+  background: var(--color-seam-lit);
+  border-radius: 1px;
+}
+
+/* The head is a vertical bar, not a knob — it reads as a playhead over time. */
+.scrub::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 3px;
+  height: 22px;
+  margin-top: -10px;
+  border-radius: 1px;
+  background: var(--color-live);
+  box-shadow: 0 0 0 1px var(--color-void), 0 0 12px 0 var(--color-live);
+  transition: background 120ms var(--ease-instrument);
+}
+.scrub::-moz-range-thumb {
+  width: 3px;
+  height: 22px;
+  border: none;
+  border-radius: 1px;
+  background: var(--color-live);
+  box-shadow: 0 0 0 1px var(--color-void), 0 0 12px 0 var(--color-live);
+}
+
+.scrub:disabled::-webkit-slider-thumb { background: var(--color-graphite); box-shadow: none; }
+.scrub:disabled::-moz-range-thumb     { background: var(--color-graphite); box-shadow: none; }
+
+/* ==========================================================================
+   Entrances. Short and mechanical (120–180ms) — a state change is a switch
+   flipping, not an animation playing.
+   ========================================================================== */
+
+@keyframes rc-rise {
+  from { opacity: 0; transform: translateY(3px); }
+  to   { opacity: 1; transform: none; }
+}
+.rise { animation: rc-rise 180ms var(--ease-instrument) both; }
+
+@keyframes rc-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+.pulse { animation: rc-pulse 2s var(--ease-instrument) infinite; }
+
+/* Applied to a list while its next state is in flight: the old data stays
+   legible rather than blanking, so dragging the scrubber never flickers. */
+.inflight {
+  opacity: 0.45;
+  transition: opacity 120ms var(--ease-instrument);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise, .pulse { animation: none; }
+  * { transition-duration: 1ms !important; }
+}
